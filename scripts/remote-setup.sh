@@ -4,7 +4,7 @@ set -euo pipefail
 DOMAIN="${SYNC_DOMAIN:?Set SYNC_DOMAIN}"
 APP_DIR="/opt/e2ee-sync"
 DATA_DIR="/var/lib/e2ee-sync"
-PORT="${SYNC_PORT:-8787}"
+PORT="${SYNC_PORT:-8791}"
 
 if ! command -v node >/dev/null 2>&1 || ! node -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 22 ? 0 : 1)'; then
   echo "== install node 22 =="

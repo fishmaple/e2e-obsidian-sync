@@ -4,6 +4,7 @@ import { isDesktopApp, obsidianConfigDir, warnMissingObsidianConfig } from "./ob
 export interface SharedSyncConfig {
   host: string;
   accountId: string;
+  displayName: string;
   apiToken: string;
   secretKey: string;
   accessToken: string;
@@ -30,6 +31,7 @@ export function readSharedConfig(): { config: Partial<SharedSyncConfig> | null; 
     const config: Partial<SharedSyncConfig> = {};
     if (typeof parsed.host === "string") config.host = parsed.host;
     if (typeof parsed.accountId === "string") config.accountId = parsed.accountId;
+    if (typeof parsed.displayName === "string") config.displayName = parsed.displayName;
     if (typeof parsed.accessToken === "string") config.accessToken = parsed.accessToken;
     const apiToken = openLocal(parsed.apiTokenBox) || (typeof parsed.apiToken === "string" ? parsed.apiToken : "");
     const secretKey = openLocal(parsed.secretKeyBox) || (typeof parsed.secretKey === "string" ? parsed.secretKey : "");
@@ -56,6 +58,7 @@ export function writeSharedConfig(config: SharedSyncConfig): void {
   const body = {
     host: config.host,
     accountId: config.accountId,
+    displayName: config.displayName,
     accessToken: config.accessToken,
     apiTokenBox: sealLocal(config.apiToken) satisfies LocalBox,
     secretKeyBox: sealLocal(config.secretKey) satisfies LocalBox,
@@ -74,6 +77,7 @@ export function applySharedConfig<T extends SharedSyncConfig>(settings: T, share
   if (!shared) return settings;
   if (typeof shared.host === "string") settings.host = shared.host;
   if (typeof shared.accountId === "string") settings.accountId = shared.accountId;
+  if (typeof shared.displayName === "string") settings.displayName = shared.displayName;
   if (typeof shared.apiToken === "string") settings.apiToken = shared.apiToken;
   if (typeof shared.secretKey === "string") settings.secretKey = shared.secretKey;
   if (typeof shared.accessToken === "string") settings.accessToken = shared.accessToken;

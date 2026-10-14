@@ -18,6 +18,7 @@ export interface ServerHealth {
 export interface Bootstrap {
   mode: "central" | "single";
   accountId: string | null;
+  displayName?: string;
   apiToken?: string;
   requireEncryption: boolean;
   registration: boolean;
@@ -32,7 +33,7 @@ export async function fetchBootstrap(host: string, accessToken: string, issue = 
   return publicJson(host, "GET", path, undefined, accessToken);
 }
 
-export async function exchangeLogin(host: string, code: string, state: string): Promise<{ accountId: string; apiToken: string }> {
+export async function exchangeLogin(host: string, code: string, state: string): Promise<{ accountId: string; apiToken: string; displayName?: string }> {
   return publicJson(host, "POST", "/api/v1/auth/exchange", { code, state });
 }
 
@@ -40,13 +41,14 @@ export async function startDeviceLogin(host: string): Promise<{ deviceCode: stri
   return publicJson(host, "POST", "/api/v1/device/start");
 }
 
-export async function pollDevice(host: string, code: string): Promise<{ pending: boolean; accountId?: string; apiToken?: string }> {
+export async function pollDevice(host: string, code: string): Promise<{ pending: boolean; accountId?: string; displayName?: string; apiToken?: string }> {
   const response = await send("GET", `${host}/api/v1/device/poll?code=${encodeURIComponent(code)}`);
   if (response.status === 202) return { pending: true };
   if (response.status === 200) {
     return {
       pending: false,
       accountId: String(response.json.accountId ?? ""),
+      displayName: String(response.json.displayName ?? ""),
       apiToken: String(response.json.apiToken ?? ""),
     };
   }
@@ -62,6 +64,10 @@ export class SyncClient {
 
   vaults(): Promise<{ vaults: VaultStat[] }> {
     return this.authed("GET", "/api/v1/vaults");
+  }
+
+  profile(): Promise<{ accountId: string; displayName: string }> {
+    return this.authed("GET", "/api/v1/account");
   }
 
   manifest(vault: string): Promise<Manifest> {

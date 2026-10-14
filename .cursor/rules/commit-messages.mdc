@@ -1,0 +1,8 @@
+---
+description: Commit messages in this repository are English
+alwaysApply: true
+---
+
+# Commit messages
+
+Every commit message in this repository is English. Keep the existing git author. Do not add an AI or Co-authored-by trailer.

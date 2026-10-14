@@ -130,7 +130,6 @@ export async function pushVault(plugin: E2eeSyncPlugin): Promise<string> {
   }
 
   plugin.settings.index = index;
-  plugin.settings.lastSyncAt = Date.now();
   const large = skippedLarge.length ? t("large", { n: skippedLarge.length }) : "";
   plugin.settings.lastSyncSummary = t("summary", {
     vault: ready.vaultName,

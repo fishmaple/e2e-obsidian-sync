@@ -10,7 +10,6 @@ import type E2eeSyncPlugin from "./main";
 
 export class E2eeSettingTab extends PluginSettingTab {
   private keyInput: HTMLInputElement | null = null;
-  private accountDesc: HTMLElement | null = null;
   private statusEl: HTMLElement | null = null;
 
   constructor(private readonly plugin: E2eeSyncPlugin) {
@@ -59,22 +58,28 @@ export class E2eeSettingTab extends PluginSettingTab {
           });
       });
 
-    const account = new Setting(containerEl)
-      .setName(t("account"))
-      .setDesc(this.plugin.settings.accountId || t("notLoggedIn"));
-    this.accountDesc = account.descEl;
-    this.accountDesc.addClass("e2ee-sync-account");
-    account.addButton((button) => {
-      button.setButtonText(t("logout")).onClick(() => {
-        void this.logout();
+    const loggedIn = Boolean(this.plugin.settings.apiToken.trim());
+    const account = new Setting(containerEl).setName(t("account"));
+    account.descEl.addClass("e2ee-sync-account");
+    if (!loggedIn) {
+      account.setDesc(t("notLoggedIn"));
+      account.addButton((button) => {
+        button.setButtonText(t("login")).setCta().onClick(() => {
+          void this.login();
+        });
       });
-    });
-    account.addButton((button) => {
-      button.setButtonText(t("login")).setCta().onClick(() => {
-        void this.login();
+      containerEl.createEl("p", { text: t("loginDesc"), cls: "e2ee-sync-status-line" });
+    } else {
+      account.setDesc("");
+      account.descEl.createDiv({ text: t("accountNameLine", { name: this.plugin.settings.displayName || t("none") }) });
+      account.descEl.createDiv({ text: t("accountIdLine", { id: this.plugin.settings.accountId }) });
+      account.addButton((button) => {
+        button.setButtonText(t("logout")).onClick(() => {
+          void this.logout();
+        });
       });
-    });
-    containerEl.createEl("p", { text: t("loginDesc"), cls: "e2ee-sync-status-line" });
+      void this.refreshProfile();
+    }
 
     new Setting(containerEl)
       .setName(t("openSite"))
@@ -205,6 +210,13 @@ export class E2eeSettingTab extends PluginSettingTab {
           });
       });
 
+    const lastSync = new Setting(containerEl)
+      .setName(t("lastSync"))
+      .setDesc(lastSyncText(this.plugin));
+    this.plugin.onSyncMeta = () => {
+      lastSync.setDesc(lastSyncText(this.plugin));
+    };
+
     new Setting(containerEl)
       .setName(t("actions"))
       .addButton((button) => button.setButtonText(t("test")).onClick(() => { void this.testConnection(); }))
@@ -224,7 +236,23 @@ export class E2eeSettingTab extends PluginSettingTab {
   hide(): void {
     this.plugin.onStatus = undefined;
     this.plugin.onAccountFilled = undefined;
+    this.plugin.onSyncMeta = undefined;
     super.hide();
+  }
+
+  private async refreshProfile(): Promise<void> {
+    const token = this.plugin.settings.apiToken.trim();
+    if (!token) return;
+    try {
+      const profile = await new SyncClient(resolveSyncHost(this.plugin.settings.host), token).profile();
+      const name = profile.displayName.trim();
+      if (!name || name === this.plugin.settings.displayName) return;
+      this.plugin.settings.displayName = name;
+      await this.plugin.saveSettings();
+      this.display();
+    } catch {
+      // Older servers do not expose the account name.
+    }
   }
 
   private async logout(): Promise<void> {
@@ -241,6 +269,7 @@ export class E2eeSettingTab extends PluginSettingTab {
     }
     this.plugin.settings.apiToken = "";
     this.plugin.settings.accountId = "";
+    this.plugin.settings.displayName = "";
     this.plugin.settings.encryptNotes = false;
     await this.plugin.saveSettings();
     this.plugin.refreshRibbon();
@@ -272,6 +301,14 @@ export class E2eeSettingTab extends PluginSettingTab {
     this.display();
   }
 
+  private async unbind(): Promise<void> {
+    this.plugin.settings.boundVault = "";
+    this.plugin.settings.boundAccountId = "";
+    this.plugin.settings.encryptNotes = false;
+    await this.plugin.saveSettings();
+    this.display();
+  }
+
   private async renderVaults(box: HTMLElement): Promise<void> {
     const token = this.plugin.settings.apiToken.trim();
     if (!token) {
@@ -297,8 +334,9 @@ export class E2eeSettingTab extends PluginSettingTab {
           .setDesc(`${vault.files} · ${vault.encrypted ? t("encryptedLabel") : t("plainLabel")}`);
         row.addButton((button) => {
           const selected = hasActiveBinding(this.plugin.settings) && vault.name === this.plugin.settings.boundVault;
-          button.setButtonText(selected ? t("bound") : t("bind")).onClick(() => {
-            void this.bindTo(vault.name, vault.encrypted);
+          button.setButtonText(selected ? t("unbind") : t("bind")).onClick(() => {
+            if (selected) void this.unbind();
+            else void this.bindTo(vault.name, vault.encrypted);
           });
         });
       }
@@ -324,10 +362,10 @@ export class E2eeSettingTab extends PluginSettingTab {
       const host = resolveSyncHost(this.plugin.settings.host);
       const boot = await fetchBootstrap(host, this.plugin.settings.accessToken, true);
       if (boot.mode === "single" && boot.accountId && boot.apiToken) {
-        this.plugin.setLogin(boot.accountId, boot.apiToken);
-        if (this.accountDesc) this.accountDesc.setText(boot.accountId);
+        this.plugin.setLogin(boot.accountId, boot.apiToken, boot.displayName ?? "");
         await this.plugin.saveSettings();
         new Notice(t("loggedIn"));
+        this.display();
         return;
       }
       const state = bytesToBase64Url(randomBytes(32));
@@ -365,6 +403,21 @@ export class E2eeSettingTab extends PluginSettingTab {
       new Notice(error instanceof Error ? error.message : t("connectionFailed"));
     }
   }
+}
+
+function lastSyncText(plugin: E2eeSyncPlugin): string {
+  const at = plugin.settings.lastSyncAt;
+  if (!at) return t("notSynced");
+  const time = formatSyncTime(at);
+  if (plugin.settings.lastSyncKind === "incremental") return t("lastSyncLine", { kind: t("incrementalSync"), time });
+  if (plugin.settings.lastSyncKind === "full") return t("lastSyncLine", { kind: t("fullSync"), time });
+  return time;
+}
+
+function formatSyncTime(ms: number): string {
+  const date = new Date(ms);
+  const pad = (part: number) => String(part).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
 function confirmEncrypt(app: App): Promise<boolean> {

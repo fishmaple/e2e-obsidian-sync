@@ -7,11 +7,25 @@ from pathlib import Path
 import paramiko
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def load_local_env(path: Path) -> None:
+    if not path.exists():
+        return
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+load_local_env(ROOT / "server" / ".deploy.local.env")
 HOST = os.environ.get("DEPLOY_SSH_HOST", "").strip()
 PORT = int(os.environ.get("DEPLOY_SSH_PORT", "22"))
 USER = os.environ.get("DEPLOY_SSH_USER", "root").strip() or "root"
-SYNC_DOMAIN = os.environ.get("SYNC_DOMAIN", "").strip()
-SYNC_PORT = os.environ.get("SYNC_PORT", "8787").strip()
+SYNC_DOMAIN = os.environ.get("SYNC_DOMAIN", "e2e.fishmaple.cn").strip()
+SYNC_PORT = os.environ.get("SYNC_PORT", "8791").strip()
 
 
 def main() -> None:

@@ -21,6 +21,7 @@ export interface FileIndexEntry {
 export interface SyncSettings {
   host: string;
   accountId: string;
+  displayName: string;
   apiToken: string;
   secretKey: string;
   accessToken: string;
@@ -30,6 +31,7 @@ export interface SyncSettings {
   intervalMinutes: number;
   debounceSeconds: number;
   lastSyncAt: number | null;
+  lastSyncKind: "" | "full" | "incremental";
   lastSyncSummary: string;
   gitignorePrompted: boolean;
   index: Record<string, FileIndexEntry>;
@@ -38,6 +40,7 @@ export interface SyncSettings {
 const DEFAULT_SETTINGS: SyncSettings = {
   host: "",
   accountId: "",
+  displayName: "",
   apiToken: "",
   secretKey: "",
   accessToken: "",
@@ -47,6 +50,7 @@ const DEFAULT_SETTINGS: SyncSettings = {
   intervalMinutes: 5,
   debounceSeconds: 30,
   lastSyncAt: null,
+  lastSyncKind: "",
   lastSyncSummary: "",
   gitignorePrompted: false,
   index: {},
@@ -57,6 +61,7 @@ export default class E2eeSyncPlugin extends Plugin {
   onStatus?: (text: string) => void;
   private syncing = false;
   private pending = false;
+  private pendingKind: "full" | "incremental" = "full";
   private loginToken = 0;
   private stopTimer: (() => void) | null = null;
   private debounceTimer: number | null = null;
@@ -65,6 +70,7 @@ export default class E2eeSyncPlugin extends Plugin {
   private dirtyPaths = new Set<string>();
   private pendingLogin: { host: string; state: string; expiresAt: number } | null = null;
   onAccountFilled?: (accountId: string) => void;
+  onSyncMeta?: () => void;
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -197,10 +203,12 @@ export default class E2eeSyncPlugin extends Plugin {
     this.refreshRibbon();
   }
 
-  setLogin(accountId: string, apiToken: string): void {
-    if (accountId !== this.settings.accountId) this.settings.index = {};
+  setLogin(accountId: string, apiToken: string, displayName = ""): void {
+    const previous = this.settings.accountId;
+    if (accountId !== previous) this.settings.index = {};
     this.settings.accountId = accountId;
     this.settings.apiToken = apiToken;
+    this.settings.displayName = displayName || (accountId === previous ? this.settings.displayName : "");
     if (this.settings.boundAccountId !== accountId) {
       this.settings.boundVault = "";
       this.settings.boundAccountId = "";
@@ -251,7 +259,7 @@ export default class E2eeSyncPlugin extends Plugin {
     try {
       const result = await exchangeLogin(pending.host, code, state);
       if (!result.accountId || !result.apiToken) throw new Error(t("loginEmpty"));
-      this.setLogin(result.accountId, result.apiToken);
+      this.setLogin(result.accountId, result.apiToken, result.displayName ?? "");
       await this.saveSettings();
       await this.alignEncryptionWithRemote();
       this.onAccountFilled?.(result.accountId);
@@ -323,13 +331,14 @@ export default class E2eeSyncPlugin extends Plugin {
     if (this.debounceTimer !== null) window.clearTimeout(this.debounceTimer);
     this.debounceTimer = window.setTimeout(() => {
       this.debounceTimer = null;
-      void this.syncNow(false);
+      void this.syncNow(false, "incremental");
     }, seconds * 1000);
   }
 
-  async syncNow(manual: boolean): Promise<boolean> {
+  async syncNow(manual: boolean, kind: "full" | "incremental" = "full"): Promise<boolean> {
     if (this.syncing) {
       this.pending = true;
+      this.pendingKind = kind;
       if (manual) new Notice(t("syncing"));
       return false;
     }
@@ -348,6 +357,9 @@ export default class E2eeSyncPlugin extends Plugin {
       this.refreshLiveStatus();
       return false;
     }
+    this.settings.lastSyncAt = Date.now();
+    this.settings.lastSyncKind = kind;
+    this.onSyncMeta?.();
     this.syncing = true;
     this.setStatus(t("syncingNow"));
     try {
@@ -366,8 +378,10 @@ export default class E2eeSyncPlugin extends Plugin {
       this.syncing = false;
       this.refreshLiveStatus();
       if (this.pending) {
+        const next = this.pendingKind;
         this.pending = false;
-        this.scheduleDebounced();
+        if (next === "incremental") this.scheduleDebounced();
+        else void this.syncNow(false, "full");
       }
     }
   }
@@ -395,8 +409,10 @@ export default class E2eeSyncPlugin extends Plugin {
       this.syncing = false;
       this.refreshLiveStatus();
       if (this.pending) {
+        const next = this.pendingKind;
         this.pending = false;
-        this.scheduleDebounced();
+        if (next === "incremental") this.scheduleDebounced();
+        else void this.syncNow(false, "full");
       }
     }
   }

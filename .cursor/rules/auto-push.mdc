@@ -1,0 +1,12 @@
+---
+description: Push client changes to GitHub unless the user says not to
+alwaysApply: true
+---
+
+# GitHub push
+
+Unless the user says not to publish a change, commit it and push it to git@github.com:fishmaple/e2e-obsidian-sync-client.git `main`.
+
+Commit messages are English. Keep the existing git author. Do not add an AI or Co-authored-by trailer.
+
+Do not commit `server/`, `README.md`, `docs/`, or `server/.deploy.local.env`. Do not change git config. Do not force-push.
