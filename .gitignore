@@ -2,7 +2,7 @@ node_modules/
 dist/
 *.log
 .env
-server/data/
+server/
 plugin/main.js
 plugin/main.js.map
 .DS_Store
