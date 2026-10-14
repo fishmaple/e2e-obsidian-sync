@@ -8,3 +8,4 @@ plugin/main.js.map
 .DS_Store
 README.md
 docs/
+.cursor/rules/
