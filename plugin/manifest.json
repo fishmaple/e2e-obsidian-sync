@@ -1,0 +1,9 @@
+{
+  "id": "e2ee-sync",
+  "name": "端到端加密同步",
+  "version": "0.1.1",
+  "minAppVersion": "1.5.0",
+  "description": "用点对点加密定期把全库笔记同步到服务器。",
+  "author": "e2ee-sync",
+  "isDesktopOnly": false
+}

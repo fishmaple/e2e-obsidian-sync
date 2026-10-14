@@ -1,0 +1,10 @@
+node_modules/
+dist/
+*.log
+.env
+server/data/
+plugin/main.js
+plugin/main.js.map
+.DS_Store
+README.md
+docs/

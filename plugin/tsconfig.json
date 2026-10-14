@@ -1,0 +1,18 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noEmit": true,
+    "lib": ["ES2022", "DOM"],
+    "skipLibCheck": true,
+    "types": []
+  },
+  "include": [
+    "src/**/*.ts",
+    "../shared/src/codec.ts",
+    "../shared/src/crypto.ts",
+    "../shared/src/protocol.ts"
+  ]
+}

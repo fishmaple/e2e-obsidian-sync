@@ -1,0 +1,51 @@
+.e2ee-sync-status-line {
+  margin: 8px 0 16px;
+  color: var(--text-muted);
+  white-space: pre-wrap;
+}
+
+.e2ee-sync-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.e2ee-sync-live {
+  cursor: pointer;
+}
+
+.e2ee-sync-vaults {
+  display: grid;
+  gap: 8px;
+}
+
+.e2ee-sync-vault {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  cursor: pointer;
+}
+
+.e2ee-sync-vault.is-selected {
+  border-color: var(--interactive-accent);
+}
+
+.e2ee-sync-star {
+  color: var(--text-accent);
+  font-weight: 700;
+}
+
+.e2ee-sync-account {
+  font-family: var(--font-monospace);
+  user-select: all;
+}
+
+.e2ee-sync-name {
+  display: grid;
+  gap: 6px;
+  margin: 12px 0;
+}
+
+.e2ee-sync-name input {
+  width: 100%;
+}
