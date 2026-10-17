@@ -43,6 +43,7 @@ export interface Manifest {
 
 export interface ObjectPayload {
   vault: string;
+  vaultId?: string;
   pathCipher: PayloadCipher;
   contentCipher: PayloadCipher;
   contentMac: string;
@@ -52,6 +53,7 @@ export interface ObjectPayload {
 }
 
 export interface VaultStat {
+  id: string;
   name: string;
   files: number;
   bytes: number;

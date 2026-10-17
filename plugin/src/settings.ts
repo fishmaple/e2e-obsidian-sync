@@ -177,18 +177,27 @@ export class E2eeSettingTab extends PluginSettingTab {
         });
       });
 
+    const bound = hasActiveBinding(this.plugin.settings);
     const vaults = new Setting(containerEl)
       .setName(t("vaultList"))
-      .setDesc(hasActiveBinding(this.plugin.settings)
-        ? `${t("bound")}：${this.plugin.settings.boundVault}`
-        : t("vaultListDesc"));
-    vaults.addButton((button) => {
-      button.setButtonText(t("bindNew")).onClick(() => {
-        void this.bindNew();
+      .setDesc(bindingText(this.plugin));
+    if (bound) {
+      vaults.descEl.createDiv({
+        text: t("remoteId", { id: this.plugin.settings.boundVaultId }),
+        cls: "e2ee-sync-status-line",
       });
-    });
-    const vaultBox = containerEl.createDiv({ cls: "e2ee-sync-vault-list" });
-    void this.renderVaults(vaultBox);
+      vaults.addButton((button) => {
+        button.setButtonText(t("openRemote")).onClick(() => { void this.openRemote(); });
+      });
+      vaults.addButton((button) => {
+        button.setButtonText(t("unbind")).onClick(() => { this.confirmUnbind(); });
+      });
+    } else if (this.plugin.settings.apiToken.trim()) {
+      vaults.addButton((button) => {
+        button.setButtonText(t("pickRemote")).setCta().onClick(() => { promptBind(this.plugin); });
+      });
+    }
+    void this.refreshBinding();
 
     new Setting(containerEl)
       .setName(t("autoSync"))
@@ -273,9 +282,7 @@ export class E2eeSettingTab extends PluginSettingTab {
         // The remote token may already be invalid. Clear the local login anyway.
       }
     }
-    if (this.plugin.settings.boundVault && this.plugin.settings.accountId && !this.plugin.settings.boundAccountId) {
-      this.plugin.settings.boundAccountId = this.plugin.settings.accountId;
-    }
+    this.plugin.rememberBinding();
     this.plugin.settings.apiToken = "";
     this.plugin.settings.accountId = "";
     this.plugin.settings.displayName = "";
@@ -286,65 +293,42 @@ export class E2eeSettingTab extends PluginSettingTab {
     this.display();
   }
 
-  private async bindNew(): Promise<void> {
-    try {
-      const name = this.plugin.app.vault.getName().trim();
-      if (!name || /[\u0000-\u001f\u007f\\/]/.test(name) || name.length > 120) throw new Error(t("badVaultName"));
-      const token = this.plugin.settings.apiToken.trim();
-      if (!token) throw new Error(t("needLogin"));
-      const remote = await new SyncClient(resolveSyncHost(this.plugin.settings.host), token).ensureVault(name);
-      await this.bindTo(remote.name, remote.encrypted);
-    } catch (error) {
-      new Notice(error instanceof Error ? error.message : t("needBind"));
-    }
-  }
-
-  private async bindTo(name: string, encrypted: boolean): Promise<void> {
-    await this.plugin.bindVault(name, encrypted);
-    this.display();
+  private confirmUnbind(): void {
+    const name = this.plugin.settings.boundVault;
+    new UnbindConfirm(this.app, name, (ok) => {
+      if (ok) void this.unbind();
+    }).open();
   }
 
   private async unbind(): Promise<void> {
-    this.plugin.settings.boundVault = "";
-    this.plugin.settings.boundAccountId = "";
-    this.plugin.settings.encryptNotes = false;
+    const accountId = this.plugin.settings.accountId;
+    if (accountId) delete this.plugin.settings.vaultBindings[accountId];
+    this.plugin.clearBinding();
     await this.plugin.saveSettings();
     this.display();
   }
 
-  private async renderVaults(box: HTMLElement): Promise<void> {
-    const token = this.plugin.settings.apiToken.trim();
-    if (!token) {
-      box.setText(t("notLoggedIn"));
+  private async refreshBinding(): Promise<void> {
+    const before = `${this.plugin.settings.boundVaultId}|${this.plugin.settings.encryptNotes}`;
+    try {
+      await this.plugin.refreshBoundIdentity();
+    } catch {
       return;
     }
+    const after = `${this.plugin.settings.boundVaultId}|${this.plugin.settings.encryptNotes}`;
+    if (after !== before) this.display();
+  }
+
+  private async openRemote(): Promise<void> {
     try {
       const host = resolveSyncHost(this.plugin.settings.host);
-      const changed = await this.plugin.alignEncryptionWithRemote();
-      if (changed) {
-        this.display();
-        return;
-      }
-      const { vaults } = await new SyncClient(host, token).vaults();
-      box.empty();
-      if (vaults.length === 0) {
-        box.setText(t("noBackups"));
-        return;
-      }
-      for (const vault of vaults) {
-        const row = new Setting(box)
-          .setName(vault.name)
-          .setDesc(`${vault.files} · ${vault.encrypted ? t("encryptedLabel") : t("plainLabel")}`);
-        row.addButton((button) => {
-          const selected = hasActiveBinding(this.plugin.settings) && vault.name === this.plugin.settings.boundVault;
-          button.setButtonText(selected ? t("unbind") : t("bind")).onClick(() => {
-            if (selected) void this.unbind();
-            else void this.bindTo(vault.name, vault.encrypted);
-          });
-        });
-      }
+      const token = this.plugin.settings.apiToken.trim();
+      const vaultId = this.plugin.settings.boundVaultId.trim();
+      if (!token || !vaultId) throw new Error(t("needBind"));
+      const { code } = await new SyncClient(host, token).webSession();
+      openExternal(`${host}/account/enter?code=${encodeURIComponent(code)}&vault=${encodeURIComponent(vaultId)}`);
     } catch (error) {
-      box.setText(error instanceof Error ? error.message : t("needLogin"));
+      new Notice(error instanceof Error ? error.message : t("cannotOpen"));
     }
   }
 
@@ -367,9 +351,11 @@ export class E2eeSettingTab extends PluginSettingTab {
       if (boot.mode === "single" && boot.accountId && boot.apiToken) {
         this.plugin.setLogin(boot.accountId, boot.apiToken, boot.displayName ?? "");
         await this.plugin.saveSettings();
+        await this.plugin.refreshBoundIdentity();
+        await this.plugin.alignEncryptionWithRemote();
         new Notice(t("loggedIn"));
         this.display();
-        promptBind(this.plugin);
+        if (!hasActiveBinding(this.plugin.settings)) promptBind(this.plugin);
         return;
       }
       const state = bytesToBase64Url(randomBytes(32));
@@ -484,6 +470,41 @@ class SyncTypesModal extends Modal {
     new Notice(t("suffixSaved"));
     this.close();
     this.done();
+  }
+}
+
+function bindingText(plugin: E2eeSyncPlugin): string {
+  if (!plugin.settings.apiToken.trim()) return t("notLoggedIn");
+  if (!hasActiveBinding(plugin.settings)) return t("remoteUnbound");
+  return t("remoteBound", { name: plugin.settings.boundVault });
+}
+
+class UnbindConfirm extends Modal {
+  private settled = false;
+
+  constructor(app: App, private readonly vaultName: string, private readonly choose: (ok: boolean) => void) {
+    super(app);
+  }
+
+  onOpen(): void {
+    this.titleEl.setText(t("unbindTitle"));
+    this.contentEl.createEl("p", { text: t("unbindBody", { name: this.vaultName }) });
+    const row = this.contentEl.createDiv({ cls: "e2ee-sync-actions" });
+    const ok = row.createEl("button", { text: t("unbind"), cls: "mod-warning" });
+    ok.onclick = () => this.finish(true);
+    const cancel = row.createEl("button", { text: t("cancel") });
+    cancel.onclick = () => this.finish(false);
+  }
+
+  onClose(): void {
+    this.finish(false);
+  }
+
+  private finish(ok: boolean): void {
+    if (this.settled) return;
+    this.settled = true;
+    this.choose(ok);
+    this.close();
   }
 }
 

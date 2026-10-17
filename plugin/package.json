@@ -1,7 +1,7 @@
 {
   "name": "e2ee-sync",
   "private": true,
-  "version": "0.2.0-beta",
+  "version": "0.3.0-beta",
   "scripts": {
     "dev": "node esbuild.config.mjs",
     "build": "node esbuild.config.mjs production",

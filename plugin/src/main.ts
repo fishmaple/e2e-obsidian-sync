@@ -20,6 +20,12 @@ export interface FileIndexEntry {
   syncedAt?: number;
 }
 
+export interface VaultBinding {
+  vaultId: string;
+  vaultName: string;
+  encryptNotes: boolean;
+}
+
 export interface SyncSettings {
   host: string;
   accountId: string;
@@ -29,7 +35,9 @@ export interface SyncSettings {
   accessToken: string;
   encryptNotes: boolean;
   boundVault: string;
+  boundVaultId: string;
   boundAccountId: string;
+  vaultBindings: Record<string, VaultBinding>;
   autoSync: boolean;
   autoSyncSeconds: number;
   syncSuffixes: string[];
@@ -49,7 +57,9 @@ const DEFAULT_SETTINGS: SyncSettings = {
   accessToken: "",
   encryptNotes: false,
   boundVault: "",
+  boundVaultId: "",
   boundAccountId: "",
+  vaultBindings: {},
   autoSync: true,
   autoSyncSeconds: 30,
   syncSuffixes: allSuffixes(),
@@ -166,6 +176,8 @@ export default class E2eeSyncPlugin extends Plugin {
       : allSuffixes();
     if (typeof rest.syncOther !== "boolean") this.settings.syncOther = true;
     this.settings.index ??= {};
+    this.settings.boundVaultId = typeof rest.boundVaultId === "string" ? rest.boundVaultId : "";
+    this.settings.vaultBindings = normalizeBindings(rest.vaultBindings);
     const shared = readSharedConfig();
     applySharedConfig(this.settings, shared.config);
     if (this.settings.boundVault && this.settings.accountId && !this.settings.boundAccountId) {
@@ -231,17 +243,42 @@ export default class E2eeSyncPlugin extends Plugin {
 
   setLogin(accountId: string, apiToken: string, displayName = ""): void {
     const previous = this.settings.accountId;
-    if (accountId !== previous) this.settings.index = {};
+    if (previous && previous !== accountId) this.rememberBinding(previous);
     this.settings.accountId = accountId;
     this.settings.apiToken = apiToken;
     this.settings.displayName = displayName || (accountId === previous ? this.settings.displayName : "");
-    if (this.settings.boundAccountId !== accountId) {
-      this.settings.boundVault = "";
-      this.settings.boundAccountId = "";
-      this.settings.encryptNotes = false;
-      this.settings.index = {};
+    const saved = this.settings.vaultBindings[accountId];
+    if (saved?.vaultId) {
+      if (saved.vaultId !== this.settings.boundVaultId) this.settings.index = {};
+      this.settings.boundVaultId = saved.vaultId;
+      this.settings.boundVault = saved.vaultName;
+      this.settings.boundAccountId = accountId;
+      this.settings.encryptNotes = saved.encryptNotes;
+    } else if (this.settings.boundAccountId === accountId && (this.settings.boundVaultId || this.settings.boundVault)) {
+      this.rememberBinding(accountId);
+    } else {
+      if (this.settings.boundVaultId || this.settings.boundVault) this.settings.index = {};
+      this.clearBinding();
     }
     this.refreshRibbon();
+  }
+
+  rememberBinding(accountId = this.settings.accountId): void {
+    if (!accountId) return;
+    if (!this.settings.boundVaultId && !this.settings.boundVault) return;
+    if (this.settings.boundAccountId && this.settings.boundAccountId !== accountId) return;
+    this.settings.vaultBindings[accountId] = {
+      vaultId: this.settings.boundVaultId,
+      vaultName: this.settings.boundVault,
+      encryptNotes: this.settings.encryptNotes,
+    };
+  }
+
+  clearBinding(): void {
+    this.settings.boundVault = "";
+    this.settings.boundVaultId = "";
+    this.settings.boundAccountId = "";
+    this.settings.encryptNotes = false;
   }
 
   async alignEncryptionWithRemote(): Promise<boolean> {
@@ -257,15 +294,33 @@ export default class E2eeSyncPlugin extends Plugin {
     if (!hasActiveBinding(this.settings)) return false;
     const host = resolveSyncHost(this.settings.host);
     const { vaults } = await new SyncClient(host, this.settings.apiToken).vaults();
-    return Boolean(vaults.find((vault) => vault.name === this.settings.boundVault)?.encrypted);
+    const match = this.settings.boundVaultId
+      ? vaults.find((vault) => vault.id === this.settings.boundVaultId)
+      : vaults.find((vault) => vault.name === this.settings.boundVault);
+    return Boolean(match?.encrypted);
   }
 
-  async bindVault(name: string, encrypted: boolean): Promise<void> {
-    const switched = this.settings.boundVault !== name || this.settings.boundAccountId !== this.settings.accountId;
+  async refreshBoundIdentity(): Promise<void> {
+    if (!this.settings.apiToken.trim() || this.settings.boundAccountId !== this.settings.accountId) return;
+    if (!this.settings.boundVaultId && !this.settings.boundVault) return;
+    const host = resolveSyncHost(this.settings.host);
+    const { vaults } = await new SyncClient(host, this.settings.apiToken).vaults();
+    const match = this.settings.boundVaultId
+      ? vaults.find((vault) => vault.id === this.settings.boundVaultId)
+      : vaults.find((vault) => vault.name === this.settings.boundVault);
+    if (!match?.id) return;
+    if (match.id === this.settings.boundVaultId && match.name === this.settings.boundVault && match.encrypted === this.settings.encryptNotes) return;
+    await this.bindVault(match.name, match.encrypted, match.id);
+  }
+
+  async bindVault(name: string, encrypted: boolean, vaultId: string): Promise<void> {
+    const switched = this.settings.boundVaultId !== vaultId || this.settings.boundAccountId !== this.settings.accountId;
     if (switched || this.settings.encryptNotes !== encrypted) this.settings.index = {};
     this.settings.boundVault = name;
+    this.settings.boundVaultId = vaultId;
     this.settings.boundAccountId = this.settings.accountId;
     this.settings.encryptNotes = encrypted;
+    this.rememberBinding();
     await this.saveSettings();
     if (encrypted && this.settings.secretKey.trim().length < MIN_SECRET_LENGTH) new Notice(t("fillKeyThenSync"));
   }
@@ -297,10 +352,11 @@ export default class E2eeSyncPlugin extends Plugin {
       if (!result.accountId || !result.apiToken) throw new Error(t("loginEmpty"));
       this.setLogin(result.accountId, result.apiToken, result.displayName ?? "");
       await this.saveSettings();
+      await this.refreshBoundIdentity();
       await this.alignEncryptionWithRemote();
       this.onAccountFilled?.(result.accountId);
       new Notice(t("loggedIn"));
-      promptBind(this);
+      if (!hasActiveBinding(this.settings)) promptBind(this);
     } catch (error) {
       new Notice(error instanceof Error ? error.message : t("loginReturnFailed"));
     }
@@ -416,7 +472,7 @@ export default class E2eeSyncPlugin extends Plugin {
     new RestoreModal(this.app, this).open();
   }
 
-  async restoreNow(vaultName: string, mode: RestoreMode, localName = ""): Promise<void> {
+  async restoreNow(remote: { id: string; name: string }, mode: RestoreMode, folder = ""): Promise<void> {
     if (this.syncing) {
       new Notice(t("syncBusy"));
       return;
@@ -424,7 +480,7 @@ export default class E2eeSyncPlugin extends Plugin {
     this.syncing = true;
     this.setStatus(t("restoring"));
     try {
-      const summary = await restoreVault(this, vaultName, mode, localName);
+      const summary = await restoreVault(this, remote, mode, folder);
       this.setStatus(summary);
       new Notice(summary);
     } catch (error) {
@@ -440,6 +496,22 @@ export default class E2eeSyncPlugin extends Plugin {
       }
     }
   }
+}
+
+function normalizeBindings(value: unknown): Record<string, VaultBinding> {
+  if (!value || typeof value !== "object") return {};
+  const bindings: Record<string, VaultBinding> = {};
+  for (const [accountId, raw] of Object.entries(value)) {
+    if (!raw || typeof raw !== "object") continue;
+    const row = raw as { vaultId?: unknown; vaultName?: unknown; encryptNotes?: unknown };
+    if (typeof row.vaultId !== "string" || typeof row.vaultName !== "string") continue;
+    bindings[accountId] = {
+      vaultId: row.vaultId,
+      vaultName: row.vaultName,
+      encryptNotes: row.encryptNotes === true,
+    };
+  }
+  return bindings;
 }
 
 export function clampAutoSyncSeconds(seconds: number): number {

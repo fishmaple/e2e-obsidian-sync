@@ -66,7 +66,7 @@ export async function pushVault(plugin: E2eeSyncPlugin): Promise<string> {
     if (boot.requireEncryption) throw new Error(t("serverEncrypt"));
   }
   const files = plugin.app.vault.getFiles().filter((file) => shouldSync(plugin, file.path));
-  const manifest = await ready.client.manifest(ready.vaultName);
+  const manifest = await ready.client.manifest(ready.vaultId);
   const remote = new Map(manifest.files.map((file) => [file.fileId, file]));
   const seen = new Set<string>();
   const index = { ...plugin.settings.index };
@@ -102,6 +102,7 @@ export async function pushVault(plugin: E2eeSyncPlugin): Promise<string> {
     }
     await ready.client.putObject(fileId, {
       vault: ready.vaultName,
+      vaultId: ready.vaultId,
       pathCipher: ready.keys
         ? await sealBytes(ready.keys.encKey, new TextEncoder().encode(file.path), `path:${fileId}`, true)
         : { v: 0, raw: bytesToBase64(new TextEncoder().encode(file.path)) },
@@ -172,16 +173,24 @@ function shouldSync(plugin: E2eeSyncPlugin, path: string): boolean {
   return suffixSelected(normalized, plugin.settings.syncSuffixes, plugin.settings.syncOther);
 }
 
-export async function restoreVault(plugin: E2eeSyncPlugin, vaultName: string, mode: RestoreMode, localName = ""): Promise<string> {
+export async function restoreVault(
+  plugin: E2eeSyncPlugin,
+  remote: { id: string; name: string },
+  mode: RestoreMode,
+  folder = "",
+): Promise<string> {
   const token = plugin.settings.apiToken.trim();
   if (!token) throw new Error(t("needLogin"));
+  const vaultName = remote.name.trim();
+  const vaultId = remote.id.trim();
+  if (!vaultName || !vaultId) throw new Error(t("needBind"));
   const host = resolveSyncHost(plugin.settings.host);
   const client = new SyncClient(host, token, (seconds) => plugin.setStatus(t("retrying", { n: seconds })));
-  const manifest = await client.manifest(vaultName);
+  const manifest = await client.manifest(vaultId);
   const needsKey = manifest.files.some((file) => file.encoding === "e2ee");
   if (needsKey && plugin.settings.secretKey.trim().length < MIN_SECRET_LENGTH) throw new Error(t("needSecret"));
   const keys = needsKey ? await deriveKeys(requireSecret(plugin.settings.secretKey)) : null;
-  const destination = mode === "create" ? createVaultDirectory(plugin, localName.trim() || vaultName) : "";
+  const destination = mode === "create" ? prepareRestoreFolder(plugin, folder) : "";
   const written: Array<{ path: string; fileId: string; contentMac: string; encoding: Encoding }> = [];
   let restored = 0;
   for (const file of manifest.files) {
@@ -197,9 +206,7 @@ export async function restoreVault(plugin: E2eeSyncPlugin, vaultName: string, mo
     plugin.setStatus(t("restoreProgress", { done: restored, total: manifest.files.length }));
   }
   if (mode === "overwrite") {
-    plugin.settings.boundVault = vaultName;
-    plugin.settings.boundAccountId = plugin.settings.accountId;
-    plugin.settings.encryptNotes = needsKey;
+    await plugin.bindVault(vaultName, needsKey, vaultId);
     const index = { ...plugin.settings.index };
     const syncedAt = Date.now();
     for (const item of written) {
@@ -218,7 +225,7 @@ export async function restoreVault(plugin: E2eeSyncPlugin, vaultName: string, mo
   }
   if (mode === "create") {
     installPluginCopy(plugin, destination);
-    writeBoundSettings(destination, vaultName, needsKey, plugin.settings.accountId);
+    writeBoundSettings(destination, vaultName, vaultId, needsKey, plugin.settings.accountId);
     registerVault(destination);
     openExternal(`obsidian://open?path=${encodeURIComponent(destination)}`);
   }
@@ -231,7 +238,7 @@ export async function restoreVault(plugin: E2eeSyncPlugin, vaultName: string, mo
 
 export class RestoreModal extends Modal {
   private selected = "";
-  private nameInput: HTMLInputElement | null = null;
+  private vaults: VaultStat[] = [];
 
   constructor(app: App, private readonly plugin: E2eeSyncPlugin) {
     super(app);
@@ -245,9 +252,11 @@ export class RestoreModal extends Modal {
 
   private async load(): Promise<void> {
     try {
-      const ready = await openClient(this.plugin);
-      const listed = await ready.client.vaults();
-      this.render(listed.vaults);
+      const token = this.plugin.settings.apiToken.trim();
+      if (!token) throw new Error(t("needLogin"));
+      const host = resolveSyncHost(this.plugin.settings.host);
+      const listed = await new SyncClient(host, token).vaults();
+      this.render(listed.vaults.filter((vault) => vault.id && vault.name));
     } catch (error) {
       this.contentEl.empty();
       this.contentEl.createEl("p", { text: error instanceof Error ? error.message : t("readFailed") });
@@ -256,16 +265,14 @@ export class RestoreModal extends Modal {
 
   private render(vaults: VaultStat[]): void {
     this.contentEl.empty();
+    this.vaults = vaults;
     if (vaults.length === 0) {
       this.contentEl.createEl("p", { text: t("noBackups") });
       return;
     }
-    this.selected = vaults[0]?.name ?? "";
+    this.selected = vaults[0]?.id ?? "";
     this.contentEl.createEl("p", { text: t("restoreHelp") });
-    const nameRow = this.contentEl.createDiv({ cls: "e2ee-sync-name" });
-    nameRow.createEl("div", { text: t("newVaultName") });
-    this.nameInput = nameRow.createEl("input", { type: "text" });
-    this.nameInput.value = this.selected;
+    this.contentEl.createEl("p", { text: t("restoreCurrent", { name: this.plugin.app.vault.getName() }) });
     const list = this.contentEl.createDiv({ cls: "e2ee-sync-vaults" });
     const rows: HTMLElement[] = [];
     for (const vault of vaults) {
@@ -276,11 +283,7 @@ export class RestoreModal extends Modal {
         cls: "e2ee-sync-status-line",
       });
       row.onclick = () => {
-        const previous = this.selected;
-        this.selected = vault.name;
-        if (this.nameInput && (this.nameInput.value.trim() === "" || this.nameInput.value.trim() === previous)) {
-          this.nameInput.value = vault.name;
-        }
+        this.selected = vault.id;
         for (const item of rows) item.toggleClass("is-selected", item === row);
       };
       rows.push(row);
@@ -290,17 +293,34 @@ export class RestoreModal extends Modal {
     const overwrite = actions.createEl("button", { text: t("overwrite"), cls: "mod-warning" });
     overwrite.onclick = () => this.choose("overwrite");
     const create = actions.createEl("button", { text: t("createVault") });
-    create.onclick = () => this.choose("create");
+    create.onclick = () => { void this.chooseCreate(); };
     const cancel = actions.createEl("button", { text: t("cancel") });
     cancel.onclick = () => this.close();
   }
 
   private choose(mode: RestoreMode): void {
-    const vaultName = this.selected;
-    const localName = this.nameInput?.value.trim() || vaultName;
-    if (!vaultName) return;
+    const remote = this.vaults.find((vault) => vault.id === this.selected);
+    if (!remote) return;
     this.close();
-    void this.plugin.restoreNow(vaultName, mode, localName);
+    void this.plugin.restoreNow(remote, mode);
+  }
+
+  private async chooseCreate(): Promise<void> {
+    const remote = this.vaults.find((vault) => vault.id === this.selected);
+    if (!remote) return;
+    const folder = await chooseRestoreFolder(this.app);
+    if (!folder) return;
+    const name = folderName(folder);
+    if (!name || vaultNameTaken(folder)) {
+      new Notice(t("restoreNameTaken", { name: name || folder }));
+      return;
+    }
+    if (folderHasFiles(folder)) {
+      const ok = await confirmOverwrite(this.app);
+      if (!ok) return;
+    }
+    this.close();
+    void this.plugin.restoreNow(remote, "create", folder);
   }
 }
 
@@ -313,11 +333,13 @@ async function openClient(plugin: E2eeSyncPlugin): Promise<{
   client: SyncClient;
   keys: Awaited<ReturnType<typeof deriveKeys>> | null;
   vaultName: string;
+  vaultId: string;
 }> {
   const token = plugin.settings.apiToken.trim();
   if (!token) throw new Error(t("needLogin"));
   const vaultName = plugin.settings.boundVault.trim();
-  if (!vaultName || plugin.settings.boundAccountId !== plugin.settings.accountId || /[\u0000-\u001f\u007f\\/]/.test(vaultName) || vaultName.length > 120) {
+  const vaultId = plugin.settings.boundVaultId.trim();
+  if (!vaultName || !vaultId || plugin.settings.boundAccountId !== plugin.settings.accountId || /[\u0000-\u001f\u007f\\/]/.test(vaultName) || vaultName.length > 120) {
     throw new Error(t("needBind"));
   }
   await plugin.alignEncryptionWithRemote();
@@ -328,6 +350,7 @@ async function openClient(plugin: E2eeSyncPlugin): Promise<{
     client: new SyncClient(host, token, (seconds) => plugin.setStatus(t("retrying", { n: seconds }))),
     keys,
     vaultName,
+    vaultId,
   };
 }
 
@@ -337,7 +360,7 @@ function requireSecret(secret: string): string {
   return value;
 }
 
-function writeBoundSettings(dest: string, boundVault: string, encryptNotes: boolean, accountId: string): void {
+function writeBoundSettings(dest: string, boundVault: string, boundVaultId: string, encryptNotes: boolean, accountId: string): void {
   const fs = nodeFs();
   const path = fs.resolve(dest, ".obsidian", "plugins", "e2ee-sync", "data.json");
   fs.mkdirSync(fs.dirname(path), { recursive: true });
@@ -348,31 +371,155 @@ function writeBoundSettings(dest: string, boundVault: string, encryptNotes: bool
     current = {};
   }
   current.boundVault = boundVault;
+  current.boundVaultId = boundVaultId;
   current.boundAccountId = accountId;
+  const bindings = current.vaultBindings && typeof current.vaultBindings === "object"
+    ? current.vaultBindings as Record<string, unknown>
+    : {};
+  bindings[accountId] = { vaultId: boundVaultId, vaultName: boundVault, encryptNotes };
+  current.vaultBindings = bindings;
   current.encryptNotes = encryptNotes;
   fs.writeText(path, JSON.stringify(current, null, 2));
 }
 
-function createVaultDirectory(plugin: E2eeSyncPlugin, vaultName: string): string {
+function prepareRestoreFolder(plugin: E2eeSyncPlugin, folder: string): string {
   const adapter = plugin.app.vault.adapter;
   if (!(adapter instanceof FileSystemAdapter)) throw new Error(t("desktopOnly"));
   const fs = nodeFs();
-  const parent = fs.dirname(adapter.getBasePath());
-  const folder = safeFolderName(vaultName);
-  let dest = fs.resolve(parent, folder);
-  const current = fs.resolve(adapter.getBasePath());
-  if (dest === current || fs.existsSync(dest)) {
-    const suffix = t("restoreFolder");
-    dest = fs.resolve(parent, `${folder}-${suffix}`);
-    let n = 2;
-    while (dest === current || fs.existsSync(dest)) {
-      dest = fs.resolve(parent, `${folder}-${suffix}-${n}`);
-      n += 1;
-    }
-  }
-  assertInside(parent, dest);
+  const dest = fs.resolve(folder);
+  if (!dest || vaultNameTaken(dest)) throw new Error(t("restoreNameTaken", { name: folderName(dest) || dest }));
   fs.mkdirSync(dest, { recursive: true });
   return dest;
+}
+
+function folderName(folder: string): string {
+  return folder.split(/[\\/]/).filter(Boolean).pop() ?? "";
+}
+
+function vaultNameTaken(folder: string): boolean {
+  const fs = nodeFs();
+  const dest = fs.resolve(folder);
+  const name = folderName(dest).toLowerCase();
+  if (!name || name === "." || name === "..") return true;
+  const configDir = obsidianConfigDir();
+  if (!configDir) return false;
+  try {
+    const parsed = JSON.parse(fs.readText(fs.resolve(configDir, "obsidian.json"))) as {
+      vaults?: Record<string, { path?: string }>;
+    };
+    for (const vault of Object.values(parsed.vaults ?? {})) {
+      if (typeof vault.path !== "string" || !vault.path) continue;
+      const existing = fs.resolve(vault.path);
+      if (existing.toLowerCase() === dest.toLowerCase()) return true;
+      if (folderName(existing).toLowerCase() === name) return true;
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+
+function folderHasFiles(folder: string): boolean {
+  const fs = nodeFs();
+  if (!fs.existsSync(folder)) return false;
+  return fs.list(folder).some((name) => name !== ".DS_Store");
+}
+
+function chooseRestoreFolder(app: App): Promise<string> {
+  const picked = pickDirectory();
+  if (picked) return picked;
+  return askFolderPath(app);
+}
+
+function pickDirectory(): Promise<string> | null {
+  try {
+    const electron = require("electron") as {
+      dialog?: { showOpenDialog: (options: { properties: string[] }) => Promise<{ canceled?: boolean; filePaths?: string[] }> };
+      remote?: { dialog?: { showOpenDialog: (options: { properties: string[] }) => Promise<{ canceled?: boolean; filePaths?: string[] }> } };
+    };
+    const dialog = electron.dialog ?? electron.remote?.dialog;
+    if (!dialog) return null;
+    return dialog.showOpenDialog({ properties: ["openDirectory", "createDirectory"] }).then((result) => {
+      if (result.canceled || !result.filePaths?.[0]) return "";
+      return result.filePaths[0];
+    });
+  } catch {
+    return null;
+  }
+}
+
+function askFolderPath(app: App): Promise<string> {
+  return new Promise((resolve) => {
+    const modal = new FolderPathModal(app, resolve);
+    modal.open();
+  });
+}
+
+function confirmOverwrite(app: App): Promise<boolean> {
+  return new Promise((resolve) => {
+    new OverwriteFolderConfirm(app, resolve).open();
+  });
+}
+
+class FolderPathModal extends Modal {
+  private settled = false;
+  private input: HTMLInputElement | null = null;
+
+  constructor(app: App, private readonly choose: (path: string) => void) {
+    super(app);
+  }
+
+  onOpen(): void {
+    this.titleEl.setText(t("restorePickFolder"));
+    this.contentEl.createEl("p", { text: t("restoreFolderPath") });
+    this.input = this.contentEl.createEl("input", { type: "text" });
+    this.input.style.width = "100%";
+    const row = this.contentEl.createDiv({ cls: "e2ee-sync-actions" });
+    const ok = row.createEl("button", { text: t("createVault"), cls: "mod-cta" });
+    ok.onclick = () => this.finish(this.input?.value.trim() ?? "");
+    const cancel = row.createEl("button", { text: t("cancel") });
+    cancel.onclick = () => this.finish("");
+  }
+
+  onClose(): void {
+    this.finish("");
+  }
+
+  private finish(path: string): void {
+    if (this.settled) return;
+    this.settled = true;
+    this.choose(path);
+    this.close();
+  }
+}
+
+class OverwriteFolderConfirm extends Modal {
+  private settled = false;
+
+  constructor(app: App, private readonly choose: (ok: boolean) => void) {
+    super(app);
+  }
+
+  onOpen(): void {
+    this.titleEl.setText(t("createVault"));
+    this.contentEl.createEl("p", { text: t("restoreNotEmpty") });
+    const row = this.contentEl.createDiv({ cls: "e2ee-sync-actions" });
+    const ok = row.createEl("button", { text: t("restoreOverwriteFiles"), cls: "mod-warning" });
+    ok.onclick = () => this.finish(true);
+    const cancel = row.createEl("button", { text: t("cancel") });
+    cancel.onclick = () => this.finish(false);
+  }
+
+  onClose(): void {
+    this.finish(false);
+  }
+
+  private finish(ok: boolean): void {
+    if (this.settled) return;
+    this.settled = true;
+    this.choose(ok);
+    this.close();
+  }
 }
 
 function writeOutside(dest: string, relative: string, data: Uint8Array): void {
@@ -451,6 +598,7 @@ function nodeFs(): NodeFs {
     copyFileSync: (from: string, to: string) => void;
     statSync: (path: string) => { mtimeMs: number };
     utimesSync: (path: string, atime: Date, mtime: Date) => void;
+    readdirSync: (path: string) => string[];
   };
   const path = require("path") as {
     sep: string;
@@ -476,6 +624,13 @@ function nodeFs(): NodeFs {
       const when = new Date(ms);
       fs.utimesSync(target, when, when);
     },
+    list: (target) => {
+      try {
+        return fs.readdirSync(target);
+      } catch {
+        return [];
+      }
+    },
     dirname: (target) => path.dirname(target),
     resolve: (...parts) => path.resolve(...parts),
   };
@@ -493,12 +648,6 @@ function formatStamp(ms: number): string {
   return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
-function safeFolderName(name: string): string {
-  const cleaned = name.replace(/[<>:"/\\|?*\u0000-\u001f]/g, " ").replace(/[. ]+$/g, "").trim();
-  if (!cleaned || cleaned === "." || cleaned === "..") throw new Error(t("badFolder"));
-  return cleaned;
-}
-
 interface NodeFs {
   sep: string;
   existsSync: (path: string) => boolean;
@@ -507,8 +656,9 @@ interface NodeFs {
   readText: (path: string) => string;
   writeText: (path: string, data: string) => void;
   copyFile: (from: string, to: string) => void;
-  statMtime: (path: string) => number;
-  utimes: (path: string, ms: number) => void;
+    statMtime: (path: string) => number;
+    utimes: (path: string, ms: number) => void;
+    list: (path: string) => string[];
   dirname: (path: string) => string;
   resolve: (...paths: string[]) => string;
 }

@@ -90,8 +90,15 @@ export class SyncClient {
     return this.authed("POST", "/api/v1/web-session");
   }
 
-  ensureVault(name: string, encrypted = false): Promise<VaultStat> {
-    return this.authed("POST", "/api/v1/vaults", { name, encrypted });
+  async ensureVault(name: string, encrypted = false, create = false): Promise<VaultStat> {
+    const bodyText = JSON.stringify({ name, encrypted, create });
+    const response = await send("POST", `${this.host}/api/v1/vaults`, {
+      authorization: `Bearer ${this.token}`,
+      "content-type": "application/json; charset=utf-8",
+    }, bodyText, this.onRetry);
+    if (response.status === 409) throw new DuplicateVaultError();
+    if (response.status >= 400) throw new Error(errorMessage(response));
+    return response.json as VaultStat;
   }
 
   logout(): Promise<{ ok: boolean }> {
@@ -178,6 +185,13 @@ async function send(
     }
   }
   throw last instanceof Error ? last : new Error("Request failed");
+}
+
+export class DuplicateVaultError extends Error {
+  constructor() {
+    super("duplicate-vault");
+    this.name = "DuplicateVaultError";
+  }
 }
 
 function errorMessage(response: RequestUrlResponse): string {

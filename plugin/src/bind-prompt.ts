@@ -1,6 +1,6 @@
 import { Modal, Notice, type App } from "obsidian";
 import type { VaultStat } from "../../shared/src/protocol";
-import { SyncClient, resolveSyncHost } from "./client";
+import { DuplicateVaultError, SyncClient, resolveSyncHost } from "./client";
 import { t } from "./i18n";
 import type E2eeSyncPlugin from "./main";
 
@@ -39,19 +39,19 @@ class BindPrompt extends Modal {
   private render(vaults: VaultStat[]): void {
     const localName = this.plugin.app.vault.getName().trim();
     const match = vaults.find((vault) => vault.name === localName);
-    this.choice = match ? match.name : "";
+    this.choice = match?.id ?? "";
     this.contentEl.empty();
     this.contentEl.createEl("p", { text: t("bindPromptHelp") });
     const list = this.contentEl.createDiv({ cls: "e2ee-sync-vaults" });
     for (const vault of vaults) {
       const row = list.createDiv({ cls: "e2ee-sync-vault" });
-      if (vault.name === this.choice) row.addClass("is-selected");
+      if (vault.id === this.choice) row.addClass("is-selected");
       const label = row.createEl("label", { cls: "e2ee-sync-check" });
       const input = label.createEl("input", { type: "radio" });
       input.name = "e2ee-bind-vault";
-      input.checked = vault.name === this.choice;
+      input.checked = vault.id === this.choice;
       input.onchange = () => {
-        this.choice = vault.name;
+        this.choice = vault.id;
         this.mark(list, row);
       };
       const text = label.createDiv();
@@ -62,7 +62,7 @@ class BindPrompt extends Modal {
       });
       row.onclick = () => {
         input.checked = true;
-        this.choice = vault.name;
+        this.choice = vault.id;
         this.mark(list, row);
       };
     }
@@ -108,21 +108,22 @@ class BindPrompt extends Modal {
       const token = this.plugin.settings.apiToken.trim();
       if (!token) throw new Error(t("needLogin"));
       if (this.choice) {
-        const vault = vaults.find((item) => item.name === this.choice);
-        if (!vault) throw new Error(t("needBind"));
-        await this.plugin.bindVault(vault.name, vault.encrypted);
+        const vault = vaults.find((item) => item.id === this.choice);
+        if (!vault?.id) throw new Error(t("needBind"));
+        await this.plugin.bindVault(vault.name, vault.encrypted, vault.id);
       } else {
         const name = (this.nameInput?.value ?? "").trim();
         if (!name || /[\u0000-\u001f\u007f\\/]/.test(name) || name.length > 120) throw new Error(t("badVaultName"));
-        const remote = await new SyncClient(resolveSyncHost(this.plugin.settings.host), token).ensureVault(name);
-        await this.plugin.bindVault(remote.name, remote.encrypted);
+        const remote = await new SyncClient(resolveSyncHost(this.plugin.settings.host), token).ensureVault(name, false, true);
+        if (!remote.id) throw new Error(t("needBind"));
+        await this.plugin.bindVault(remote.name, remote.encrypted, remote.id);
       }
       this.close();
       this.plugin.onAccountFilled?.(this.plugin.settings.accountId);
       void this.plugin.syncNow(true);
     } catch (error) {
       this.busy = false;
-      new Notice(error instanceof Error ? error.message : t("needBind"));
+      new Notice(error instanceof DuplicateVaultError ? t("duplicateVault") : error instanceof Error ? error.message : t("needBind"));
     }
   }
 }
