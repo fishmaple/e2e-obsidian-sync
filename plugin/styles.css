@@ -49,3 +49,16 @@
 .e2ee-sync-name input {
   width: 100%;
 }
+
+.e2ee-sync-check {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+}
+
+.e2ee-sync-suffixes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  margin-bottom: 8px;
+}

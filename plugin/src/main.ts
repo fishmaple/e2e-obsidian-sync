@@ -5,7 +5,9 @@ import { offerGitignore } from "./gitignore-prompt";
 import { t } from "./i18n";
 import { openLocal, sealLocal } from "./local-secret";
 import { applySharedConfig, readSharedConfig, writeSharedConfig } from "./shared-config";
+import { promptBind } from "./bind-prompt";
 import { hasActiveBinding } from "./binding";
+import { allSuffixes } from "./file-kinds";
 import { E2eeSettingTab } from "./settings";
 import { RestoreModal, isSyncablePath, propagatePlugin, pushVault, restoreVault, type RestoreMode } from "./sync";
 
@@ -30,6 +32,8 @@ export interface SyncSettings {
   boundAccountId: string;
   autoSync: boolean;
   autoSyncSeconds: number;
+  syncSuffixes: string[];
+  syncOther: boolean;
   lastSyncAt: number | null;
   lastSyncSummary: string;
   gitignorePrompted: boolean;
@@ -48,6 +52,8 @@ const DEFAULT_SETTINGS: SyncSettings = {
   boundAccountId: "",
   autoSync: true,
   autoSyncSeconds: 30,
+  syncSuffixes: allSuffixes(),
+  syncOther: true,
   lastSyncAt: null,
   lastSyncSummary: "",
   gitignorePrompted: false,
@@ -153,6 +159,12 @@ export default class E2eeSyncPlugin extends Plugin {
     } else {
       this.settings.autoSyncSeconds = clampAutoSyncSeconds(this.settings.autoSyncSeconds);
     }
+    const known = new Set(allSuffixes());
+    const storedSuffixes = rest.syncSuffixes;
+    this.settings.syncSuffixes = Array.isArray(storedSuffixes)
+      ? storedSuffixes.filter((item): item is string => typeof item === "string" && known.has(item))
+      : allSuffixes();
+    if (typeof rest.syncOther !== "boolean") this.settings.syncOther = true;
     this.settings.index ??= {};
     const shared = readSharedConfig();
     applySharedConfig(this.settings, shared.config);
@@ -248,6 +260,16 @@ export default class E2eeSyncPlugin extends Plugin {
     return Boolean(vaults.find((vault) => vault.name === this.settings.boundVault)?.encrypted);
   }
 
+  async bindVault(name: string, encrypted: boolean): Promise<void> {
+    const switched = this.settings.boundVault !== name || this.settings.boundAccountId !== this.settings.accountId;
+    if (switched || this.settings.encryptNotes !== encrypted) this.settings.index = {};
+    this.settings.boundVault = name;
+    this.settings.boundAccountId = this.settings.accountId;
+    this.settings.encryptNotes = encrypted;
+    await this.saveSettings();
+    if (encrypted && this.settings.secretKey.trim().length < MIN_SECRET_LENGTH) new Notice(t("fillKeyThenSync"));
+  }
+
   setSecret(value: string): void {
     if (value !== this.settings.secretKey) this.settings.index = {};
     this.settings.secretKey = value;
@@ -278,6 +300,7 @@ export default class E2eeSyncPlugin extends Plugin {
       await this.alignEncryptionWithRemote();
       this.onAccountFilled?.(result.accountId);
       new Notice(t("loggedIn"));
+      promptBind(this);
     } catch (error) {
       new Notice(error instanceof Error ? error.message : t("loginReturnFailed"));
     }

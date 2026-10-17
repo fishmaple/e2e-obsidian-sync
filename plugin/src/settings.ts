@@ -5,7 +5,9 @@ import { SyncClient, fetchBootstrap, fetchHealth, openExternal, resolveSyncHost 
 import { t } from "./i18n";
 import { canSealSecrets } from "./local-secret";
 import { sharedConfigProblem } from "./shared-config";
+import { promptBind } from "./bind-prompt";
 import { hasActiveBinding } from "./binding";
+import { FILE_GROUPS } from "./file-kinds";
 import type E2eeSyncPlugin from "./main";
 
 export class E2eeSettingTab extends PluginSettingTab {
@@ -166,6 +168,15 @@ export class E2eeSettingTab extends PluginSettingTab {
       });
     });
 
+    new Setting(containerEl)
+      .setName(t("syncTypes"))
+      .setDesc(t("syncTypesDesc"))
+      .addButton((button) => {
+        button.setButtonText(t("syncTypes")).onClick(() => {
+          new SyncTypesModal(this.app, this.plugin, () => this.display()).open();
+        });
+      });
+
     const vaults = new Setting(containerEl)
       .setName(t("vaultList"))
       .setDesc(hasActiveBinding(this.plugin.settings)
@@ -289,13 +300,7 @@ export class E2eeSettingTab extends PluginSettingTab {
   }
 
   private async bindTo(name: string, encrypted: boolean): Promise<void> {
-    const switched = this.plugin.settings.boundVault !== name || this.plugin.settings.boundAccountId !== this.plugin.settings.accountId;
-    if (switched || this.plugin.settings.encryptNotes !== encrypted) this.plugin.settings.index = {};
-    this.plugin.settings.boundVault = name;
-    this.plugin.settings.boundAccountId = this.plugin.settings.accountId;
-    this.plugin.settings.encryptNotes = encrypted;
-    await this.plugin.saveSettings();
-    if (encrypted && this.plugin.settings.secretKey.trim().length < 16) new Notice(t("fillKeyThenSync"));
+    await this.plugin.bindVault(name, encrypted);
     this.display();
   }
 
@@ -364,6 +369,7 @@ export class E2eeSettingTab extends PluginSettingTab {
         await this.plugin.saveSettings();
         new Notice(t("loggedIn"));
         this.display();
+        promptBind(this.plugin);
         return;
       }
       const state = bytesToBase64Url(randomBytes(32));
@@ -420,6 +426,65 @@ function confirmEncrypt(app: App): Promise<boolean> {
     const modal = new EncryptWarning(app, resolve);
     modal.open();
   });
+}
+
+class SyncTypesModal extends Modal {
+  private selected = new Set<string>();
+  private includeOther = true;
+
+  constructor(app: App, private readonly plugin: E2eeSyncPlugin, private readonly done: () => void) {
+    super(app);
+    this.selected = new Set(plugin.settings.syncSuffixes);
+    this.includeOther = plugin.settings.syncOther;
+  }
+
+  onOpen(): void {
+    this.titleEl.setText(t("syncTypesTitle"));
+    this.contentEl.createEl("p", { text: t("syncTypesDesc") });
+    const names = {
+      image: t("groupImage"),
+      video: t("groupVideo"),
+      audio: t("groupAudio"),
+      document: t("groupDocument"),
+      obsidian: t("groupObsidian"),
+    } as const;
+    for (const group of FILE_GROUPS) {
+      this.contentEl.createEl("h3", { text: names[group.id] });
+      const grid = this.contentEl.createDiv({ cls: "e2ee-sync-suffixes" });
+      for (const suffix of group.suffixes) {
+        const label = grid.createEl("label", { cls: "e2ee-sync-check" });
+        const input = label.createEl("input", { type: "checkbox" });
+        input.checked = this.selected.has(suffix);
+        input.onchange = () => {
+          if (input.checked) this.selected.add(suffix);
+          else this.selected.delete(suffix);
+        };
+        label.createSpan({ text: `.${suffix}` });
+      }
+    }
+    this.contentEl.createEl("h3", { text: t("groupOther") });
+    const other = this.contentEl.createEl("label", { cls: "e2ee-sync-check" });
+    const otherInput = other.createEl("input", { type: "checkbox" });
+    otherInput.checked = this.includeOther;
+    otherInput.onchange = () => {
+      this.includeOther = otherInput.checked;
+    };
+    other.createSpan({ text: t("groupOtherDesc") });
+    const actions = this.contentEl.createDiv({ cls: "e2ee-sync-actions" });
+    const ok = actions.createEl("button", { text: t("save"), cls: "mod-cta" });
+    ok.onclick = () => { void this.save(); };
+    const cancel = actions.createEl("button", { text: t("cancel") });
+    cancel.onclick = () => this.close();
+  }
+
+  private async save(): Promise<void> {
+    this.plugin.settings.syncSuffixes = [...this.selected];
+    this.plugin.settings.syncOther = this.includeOther;
+    await this.plugin.saveSettings();
+    new Notice(t("suffixSaved"));
+    this.close();
+    this.done();
+  }
 }
 
 class LogoutConfirm extends Modal {

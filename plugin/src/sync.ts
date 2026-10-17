@@ -1,8 +1,9 @@
 import { FileSystemAdapter, Modal, Notice, TFile, type App, type Vault } from "obsidian";
 import { bytesToBase64, randomBytes } from "../../shared/src/codec";
 import { contentMac, deriveKeys, fileIdForPath, openBytes, plainFileId, plainMac, sealBytes } from "../../shared/src/crypto";
-import { MAX_FILE_BYTES, MIN_SECRET_LENGTH, type Encoding, type VaultStat } from "../../shared/src/protocol";
+import { MAX_FILE_BYTES, MIN_SECRET_LENGTH, type Encoding, type RemoteFile, type VaultStat } from "../../shared/src/protocol";
 import { SyncClient, fetchBootstrap, openExternal, resolveSyncHost } from "./client";
+import { suffixSelected } from "./file-kinds";
 import { t } from "./i18n";
 import { isDesktopApp, obsidianConfigDir, warnMissingObsidianConfig } from "./obsidian-dir";
 import type E2eeSyncPlugin from "./main";
@@ -64,12 +65,13 @@ export async function pushVault(plugin: E2eeSyncPlugin): Promise<string> {
     const boot = await fetchBootstrap(ready.host, plugin.settings.accessToken);
     if (boot.requireEncryption) throw new Error(t("serverEncrypt"));
   }
-  const files = plugin.app.vault.getFiles().filter((file) => isSyncablePath(file.path));
+  const files = plugin.app.vault.getFiles().filter((file) => shouldSync(plugin, file.path));
   const manifest = await ready.client.manifest(ready.vaultName);
   const remote = new Map(manifest.files.map((file) => [file.fileId, file]));
   const seen = new Set<string>();
   const index = { ...plugin.settings.index };
   let uploaded = 0;
+  let downloaded = 0;
   let unchanged = 0;
   const skippedLarge: string[] = [];
   const now = Date.now();
@@ -79,29 +81,23 @@ export async function pushVault(plugin: E2eeSyncPlugin): Promise<string> {
       ? await fileIdForPath(ready.keys.idKey, file.path, ready.vaultName)
       : await plainFileId(ready.vaultName, file.path);
     seen.add(fileId);
-    if (file.stat.size > MAX_FILE_BYTES) {
-      skippedLarge.push(file.path);
-      continue;
-    }
     const cached = index[fileId];
     const remoteFile = remote.get(fileId);
-    if (
-      cached
-      && cached.mtime === file.stat.mtime
-      && cached.size === file.stat.size
-      && remoteFile?.contentMac === cached.contentMac
-      && remoteFile.encoding === encoding
-      && cached.encoding === encoding
-    ) {
-      index[fileId] = { ...cached, path: file.path, syncedAt: cached.syncedAt ?? now };
-      unchanged++;
-      continue;
-    }
     const plain = new Uint8Array(await plugin.app.vault.readBinary(file));
     const mac = ready.keys ? await contentMac(ready.keys.idKey, plain) : await plainMac(plain);
     if (remoteFile?.contentMac === mac && remoteFile.encoding === encoding) {
       index[fileId] = { path: file.path, mtime: file.stat.mtime, size: file.stat.size, contentMac: mac, encoding, syncedAt: cached?.syncedAt ?? now };
       unchanged++;
+      continue;
+    }
+    if (remoteFile && remoteFile.mtime > file.stat.mtime) {
+      if (await pullRemote(plugin, ready, remoteFile, index)) downloaded++;
+      else unchanged++;
+      plugin.setStatus(t("syncProgress", { done: uploaded + downloaded + unchanged, total: files.length + remote.size }));
+      continue;
+    }
+    if (file.stat.size > MAX_FILE_BYTES) {
+      skippedLarge.push(file.path);
       continue;
     }
     await ready.client.putObject(fileId, {
@@ -119,14 +115,13 @@ export async function pushVault(plugin: E2eeSyncPlugin): Promise<string> {
     });
     index[fileId] = { path: file.path, mtime: file.stat.mtime, size: file.stat.size, contentMac: mac, encoding, syncedAt: Date.now() };
     uploaded++;
-    plugin.setStatus(t("syncProgress", { done: uploaded + unchanged, total: files.length }));
+    plugin.setStatus(t("syncProgress", { done: uploaded + downloaded + unchanged, total: files.length + remote.size }));
   }
 
-  const deleteIds = [...remote.keys()].filter((fileId) => !seen.has(fileId));
-  const result = await ready.client.deleteObjects(ready.vaultName, deleteIds, files.length, files.length > 0);
-  const deleted = result.deleted;
-  for (const fileId of Object.keys(index)) {
-    if (!seen.has(fileId)) delete index[fileId];
+  for (const remoteFile of remote.values()) {
+    if (seen.has(remoteFile.fileId)) continue;
+    if (await pullRemote(plugin, ready, remoteFile, index)) downloaded++;
+    plugin.setStatus(t("syncProgress", { done: uploaded + downloaded + unchanged, total: files.length + remote.size }));
   }
 
   plugin.settings.index = index;
@@ -134,12 +129,47 @@ export async function pushVault(plugin: E2eeSyncPlugin): Promise<string> {
   plugin.settings.lastSyncSummary = t("summary", {
     vault: ready.vaultName,
     uploaded,
+    downloaded,
     unchanged,
-    deleted,
     large,
   });
   await plugin.saveSettings();
   return plugin.settings.lastSyncSummary;
+}
+
+async function pullRemote(
+  plugin: E2eeSyncPlugin,
+  ready: Awaited<ReturnType<typeof openClient>>,
+  remoteFile: RemoteFile,
+  index: E2eeSyncPlugin["settings"]["index"],
+): Promise<boolean> {
+  if (remoteFile.size > MAX_FILE_BYTES) return false;
+  const known = index[remoteFile.fileId]?.path;
+  if (known && !shouldSync(plugin, known)) return false;
+  const stored = await ready.client.getObject(remoteFile.fileId);
+  const path = safeVaultPath(new TextDecoder().decode(
+    await openBytes(ready.keys?.encKey ?? null, stored.pathCipher, `path:${remoteFile.fileId}`),
+  ));
+  if (!shouldSync(plugin, path)) return false;
+  const data = await openBytes(ready.keys?.encKey ?? null, stored.contentCipher, `body:${remoteFile.fileId}`);
+  await writeVaultFile(plugin.app.vault, path, data);
+  stampMtime(plugin, path, remoteFile.mtime);
+  index[remoteFile.fileId] = {
+    path,
+    mtime: remoteFile.mtime,
+    size: data.byteLength,
+    contentMac: remoteFile.contentMac,
+    encoding: remoteFile.encoding,
+    syncedAt: Date.now(),
+  };
+  return true;
+}
+
+function shouldSync(plugin: E2eeSyncPlugin, path: string): boolean {
+  const normalized = path.replaceAll("\\", "/");
+  if (PLUGIN_FILES.has(normalized)) return true;
+  if (!isSyncablePath(normalized)) return false;
+  return suffixSelected(normalized, plugin.settings.syncSuffixes, plugin.settings.syncOther);
 }
 
 export async function restoreVault(plugin: E2eeSyncPlugin, vaultName: string, mode: RestoreMode, localName = ""): Promise<string> {
@@ -420,6 +450,7 @@ function nodeFs(): NodeFs {
     readFileSync: (path: string, encoding: "utf8") => string;
     copyFileSync: (from: string, to: string) => void;
     statSync: (path: string) => { mtimeMs: number };
+    utimesSync: (path: string, atime: Date, mtime: Date) => void;
   };
   const path = require("path") as {
     sep: string;
@@ -440,6 +471,10 @@ function nodeFs(): NodeFs {
       } catch {
         return 0;
       }
+    },
+    utimes: (target, ms) => {
+      const when = new Date(ms);
+      fs.utimesSync(target, when, when);
     },
     dirname: (target) => path.dirname(target),
     resolve: (...parts) => path.resolve(...parts),
@@ -473,6 +508,7 @@ interface NodeFs {
   writeText: (path: string, data: string) => void;
   copyFile: (from: string, to: string) => void;
   statMtime: (path: string) => number;
+  utimes: (path: string, ms: number) => void;
   dirname: (path: string) => string;
   resolve: (...paths: string[]) => string;
 }
@@ -487,6 +523,18 @@ function safeVaultPath(path: string): string {
   }
   if (!isSyncablePath(normalized)) throw new Error(t("blockedPath", { path: normalized }));
   return normalized;
+}
+
+function stampMtime(plugin: E2eeSyncPlugin, path: string, mtime: number): void {
+  const adapter = plugin.app.vault.adapter;
+  if (!(adapter instanceof FileSystemAdapter) || !Number.isFinite(mtime) || mtime <= 0) return;
+  const fs = nodeFs();
+  const full = fs.resolve(adapter.getBasePath(), ...path.split("/"));
+  try {
+    fs.utimes(full, mtime);
+  } catch (error) {
+    console.warn("Could not keep the synced file time", error);
+  }
 }
 
 async function writeVaultFile(vault: Vault, path: string, data: Uint8Array): Promise<void> {
