@@ -1,4 +1,4 @@
-import { Notice, Plugin, setIcon, type ObsidianProtocolData } from "obsidian";
+import { Notice, Plugin, type ObsidianProtocolData } from "obsidian";
 import { MIN_SECRET_LENGTH } from "../../shared/src/protocol";
 import { SyncClient, exchangeLogin, resolveSyncHost } from "./client";
 import { offerGitignore } from "./gitignore-prompt";
@@ -28,10 +28,9 @@ export interface SyncSettings {
   encryptNotes: boolean;
   boundVault: string;
   boundAccountId: string;
-  intervalMinutes: number;
-  debounceSeconds: number;
+  autoSync: boolean;
+  autoSyncSeconds: number;
   lastSyncAt: number | null;
-  lastSyncKind: "" | "full" | "incremental";
   lastSyncSummary: string;
   gitignorePrompted: boolean;
   index: Record<string, FileIndexEntry>;
@@ -47,10 +46,9 @@ const DEFAULT_SETTINGS: SyncSettings = {
   encryptNotes: false,
   boundVault: "",
   boundAccountId: "",
-  intervalMinutes: 5,
-  debounceSeconds: 30,
+  autoSync: true,
+  autoSyncSeconds: 30,
   lastSyncAt: null,
-  lastSyncKind: "",
   lastSyncSummary: "",
   gitignorePrompted: false,
   index: {},
@@ -61,10 +59,8 @@ export default class E2eeSyncPlugin extends Plugin {
   onStatus?: (text: string) => void;
   private syncing = false;
   private pending = false;
-  private pendingKind: "full" | "incremental" = "full";
   private loginToken = 0;
   private stopTimer: (() => void) | null = null;
-  private debounceTimer: number | null = null;
   private statusBar: HTMLElement | null = null;
   private ribbonEl: HTMLElement | null = null;
   private dirtyPaths = new Set<string>();
@@ -75,9 +71,13 @@ export default class E2eeSyncPlugin extends Plugin {
   async onload(): Promise<void> {
     await this.loadSettings();
     this.addSettingTab(new E2eeSettingTab(this));
-    this.ribbonEl = this.addRibbonIcon("cloud", t("ribbonOut"), () => this.openSettings());
+    this.ribbonEl = this.addRibbonIcon("refresh-cw", t("syncNow"), () => {
+      void this.syncNow(true);
+    });
     this.ribbonEl.addClass("e2ee-sync-ribbon");
     this.refreshRibbon();
+    this.app.workspace.onLayoutReady(() => this.pinRibbonToBottom());
+    this.registerEvent(this.app.workspace.on("layout-change", () => this.pinRibbonToBottom()));
     this.statusBar = this.addStatusBarItem();
     this.statusBar.addClass("mod-clickable");
     this.statusBar.addClass("e2ee-sync-live");
@@ -108,7 +108,6 @@ export default class E2eeSyncPlugin extends Plugin {
       const file = this.app.workspace.getActiveFile();
       if (file) this.dirtyPaths.delete(file.path);
       this.refreshLiveStatus();
-      this.scheduleDebounced();
     };
     this.registerEvent(this.app.vault.on("create", bump));
     this.registerEvent(this.app.vault.on("modify", bump));
@@ -123,16 +122,10 @@ export default class E2eeSyncPlugin extends Plugin {
     this.register(() => {
       this.loginToken++;
       this.stopTimer?.();
-      if (this.debounceTimer !== null) window.clearTimeout(this.debounceTimer);
     });
     this.reschedule();
     this.spreadPlugin();
     offerGitignore(this);
-
-    const initial = window.setTimeout(() => {
-      void this.syncNow(false);
-    }, 10_000);
-    this.register(() => window.clearTimeout(initial));
   }
 
   async loadSettings(): Promise<void> {
@@ -141,11 +134,25 @@ export default class E2eeSyncPlugin extends Plugin {
     const secretKey = openLocal(stored?.secretKeyBox) || (typeof stored?.secretKey === "string" ? stored.secretKey : "");
     const apiToken = openLocal(stored?.apiTokenBox) || (typeof stored?.apiToken === "string" ? stored.apiToken : "");
     const rest: Record<string, unknown> = { ...(stored ?? {}) };
+    const legacyDebounce = typeof rest.debounceSeconds === "number" ? rest.debounceSeconds : 30;
+    const legacyInterval = typeof rest.intervalMinutes === "number" ? rest.intervalMinutes : 5;
+    const hadAutoSync = typeof rest.autoSync === "boolean";
+    const hadAutoSyncSeconds = typeof rest.autoSyncSeconds === "number";
     delete rest.secretKey;
     delete rest.secretKeyBox;
     delete rest.apiToken;
     delete rest.apiTokenBox;
+    delete rest.debounceSeconds;
+    delete rest.intervalMinutes;
+    delete rest.lastSyncKind;
     this.settings = { ...structuredClone(DEFAULT_SETTINGS), ...rest, secretKey, apiToken };
+    if (!hadAutoSync) this.settings.autoSync = true;
+    if (!hadAutoSyncSeconds) {
+      const seconds = legacyDebounce > 0 ? legacyDebounce : legacyInterval * 60;
+      this.settings.autoSyncSeconds = clampAutoSyncSeconds(seconds);
+    } else {
+      this.settings.autoSyncSeconds = clampAutoSyncSeconds(this.settings.autoSyncSeconds);
+    }
     this.settings.index ??= {};
     const shared = readSharedConfig();
     applySharedConfig(this.settings, shared.config);
@@ -188,9 +195,16 @@ export default class E2eeSyncPlugin extends Plugin {
 
   refreshRibbon(): void {
     if (!this.ribbonEl) return;
-    const loggedIn = Boolean(this.settings.apiToken.trim());
-    setIcon(this.ribbonEl, loggedIn ? "cloud" : "cloud-off");
-    this.ribbonEl.setAttribute("aria-label", loggedIn ? t("ribbonIn") : t("ribbonOut"));
+    this.ribbonEl.setAttribute("aria-label", t("syncNow"));
+    this.ribbonEl.setAttribute("aria-label-position", "right");
+  }
+
+  private pinRibbonToBottom(): void {
+    const icon = this.ribbonEl;
+    if (!icon) return;
+    const bottom = this.app.workspace.containerEl.querySelector(".workspace-ribbon.mod-left .side-dock-settings");
+    if (!(bottom instanceof HTMLElement)) return;
+    if (icon.parentElement !== bottom || bottom.lastElementChild !== icon) bottom.append(icon);
   }
 
   setAccountId(value: string): void {
@@ -280,10 +294,13 @@ export default class E2eeSyncPlugin extends Plugin {
 
   reschedule(): void {
     this.stopTimer?.();
-    const minutes = Math.min(1440, Math.max(1, this.settings.intervalMinutes || 5));
+    this.stopTimer = null;
+    if (!this.settings.autoSync) return;
+    const seconds = clampAutoSyncSeconds(this.settings.autoSyncSeconds);
+    this.settings.autoSyncSeconds = seconds;
     const timer = window.setInterval(() => {
       void this.syncNow(false);
-    }, minutes * 60_000);
+    }, seconds * 1000);
     this.stopTimer = () => window.clearInterval(timer);
   }
 
@@ -325,20 +342,9 @@ export default class E2eeSyncPlugin extends Plugin {
     return entry.mtime !== mtime || entry.size !== size;
   }
 
-  scheduleDebounced(): void {
-    const seconds = this.settings.debounceSeconds;
-    if (seconds <= 0) return;
-    if (this.debounceTimer !== null) window.clearTimeout(this.debounceTimer);
-    this.debounceTimer = window.setTimeout(() => {
-      this.debounceTimer = null;
-      void this.syncNow(false, "incremental");
-    }, seconds * 1000);
-  }
-
-  async syncNow(manual: boolean, kind: "full" | "incremental" = "full"): Promise<boolean> {
+  async syncNow(manual: boolean): Promise<boolean> {
     if (this.syncing) {
       this.pending = true;
-      this.pendingKind = kind;
       if (manual) new Notice(t("syncing"));
       return false;
     }
@@ -358,7 +364,6 @@ export default class E2eeSyncPlugin extends Plugin {
       return false;
     }
     this.settings.lastSyncAt = Date.now();
-    this.settings.lastSyncKind = kind;
     this.onSyncMeta?.();
     this.syncing = true;
     this.setStatus(t("syncingNow"));
@@ -378,10 +383,8 @@ export default class E2eeSyncPlugin extends Plugin {
       this.syncing = false;
       this.refreshLiveStatus();
       if (this.pending) {
-        const next = this.pendingKind;
         this.pending = false;
-        if (next === "incremental") this.scheduleDebounced();
-        else void this.syncNow(false, "full");
+        void this.syncNow(false);
       }
     }
   }
@@ -409,13 +412,16 @@ export default class E2eeSyncPlugin extends Plugin {
       this.syncing = false;
       this.refreshLiveStatus();
       if (this.pending) {
-        const next = this.pendingKind;
         this.pending = false;
-        if (next === "incremental") this.scheduleDebounced();
-        else void this.syncNow(false, "full");
+        void this.syncNow(false);
       }
     }
   }
+}
+
+export function clampAutoSyncSeconds(seconds: number): number {
+  if (!Number.isFinite(seconds)) return 30;
+  return Math.min(86400, Math.max(30, Math.floor(seconds)));
 }
 
 function formatStamp(ms: number): string {

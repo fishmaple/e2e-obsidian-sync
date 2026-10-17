@@ -75,7 +75,7 @@ export class E2eeSettingTab extends PluginSettingTab {
       account.descEl.createDiv({ text: t("accountIdLine", { id: this.plugin.settings.accountId }) });
       account.addButton((button) => {
         button.setButtonText(t("logout")).onClick(() => {
-          void this.logout();
+          this.confirmLogout();
         });
       });
       void this.refreshProfile();
@@ -180,33 +180,25 @@ export class E2eeSettingTab extends PluginSettingTab {
     void this.renderVaults(vaultBox);
 
     new Setting(containerEl)
-      .setName(t("interval"))
-      .setDesc(t("intervalDesc"))
-      .addText((text) => {
-        text.setPlaceholder("5")
-          .setValue(String(this.plugin.settings.intervalMinutes))
-          .onChange(async (value) => {
-            const minutes = Number(value);
-            if (!Number.isInteger(minutes) || minutes < 1 || minutes > 1440) return;
-            if (minutes === this.plugin.settings.intervalMinutes) return;
-            this.plugin.settings.intervalMinutes = minutes;
-            await this.plugin.saveSettings();
-            this.plugin.reschedule();
-          });
-      });
-
-    new Setting(containerEl)
-      .setName(t("debounce"))
-      .setDesc(t("debounceDesc"))
+      .setName(t("autoSync"))
+      .setDesc(t("autoSyncDesc"))
+      .addToggle((toggle) => {
+        toggle.setValue(this.plugin.settings.autoSync).onChange(async (value) => {
+          this.plugin.settings.autoSync = value;
+          await this.plugin.saveSettings();
+          this.plugin.reschedule();
+        });
+      })
       .addText((text) => {
         text.setPlaceholder("30")
-          .setValue(String(this.plugin.settings.debounceSeconds))
+          .setValue(String(this.plugin.settings.autoSyncSeconds))
           .onChange(async (value) => {
             const seconds = Number(value);
-            if (!Number.isInteger(seconds) || seconds < 0 || seconds > 3600) return;
-            if (seconds === this.plugin.settings.debounceSeconds) return;
-            this.plugin.settings.debounceSeconds = seconds;
+            if (!Number.isInteger(seconds) || seconds < 30 || seconds > 86400) return;
+            if (seconds === this.plugin.settings.autoSyncSeconds) return;
+            this.plugin.settings.autoSyncSeconds = seconds;
             await this.plugin.saveSettings();
+            this.plugin.reschedule();
           });
       });
 
@@ -253,6 +245,12 @@ export class E2eeSettingTab extends PluginSettingTab {
     } catch {
       // Older servers do not expose the account name.
     }
+  }
+
+  private confirmLogout(): void {
+    new LogoutConfirm(this.app, (ok) => {
+      if (ok) void this.logout();
+    }).open();
   }
 
   private async logout(): Promise<void> {
@@ -408,10 +406,7 @@ export class E2eeSettingTab extends PluginSettingTab {
 function lastSyncText(plugin: E2eeSyncPlugin): string {
   const at = plugin.settings.lastSyncAt;
   if (!at) return t("notSynced");
-  const time = formatSyncTime(at);
-  if (plugin.settings.lastSyncKind === "incremental") return t("lastSyncLine", { kind: t("incrementalSync"), time });
-  if (plugin.settings.lastSyncKind === "full") return t("lastSyncLine", { kind: t("fullSync"), time });
-  return time;
+  return formatSyncTime(at);
 }
 
 function formatSyncTime(ms: number): string {
@@ -425,6 +420,35 @@ function confirmEncrypt(app: App): Promise<boolean> {
     const modal = new EncryptWarning(app, resolve);
     modal.open();
   });
+}
+
+class LogoutConfirm extends Modal {
+  private settled = false;
+
+  constructor(app: App, private readonly choose: (ok: boolean) => void) {
+    super(app);
+  }
+
+  onOpen(): void {
+    this.titleEl.setText(t("logoutTitle"));
+    this.contentEl.createEl("p", { text: t("logoutBody") });
+    const row = this.contentEl.createDiv({ cls: "e2ee-sync-actions" });
+    const ok = row.createEl("button", { text: t("logout"), cls: "mod-warning" });
+    ok.onclick = () => this.finish(true);
+    const cancel = row.createEl("button", { text: t("cancel") });
+    cancel.onclick = () => this.finish(false);
+  }
+
+  onClose(): void {
+    this.finish(false);
+  }
+
+  private finish(ok: boolean): void {
+    if (this.settled) return;
+    this.settled = true;
+    this.choose(ok);
+    this.close();
+  }
 }
 
 class EncryptWarning extends Modal {
