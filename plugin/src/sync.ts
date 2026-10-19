@@ -73,8 +73,11 @@ export async function pushVault(plugin: E2eeSyncPlugin): Promise<string> {
   let uploaded = 0;
   let downloaded = 0;
   let unchanged = 0;
+  let removed = 0;
   const skippedLarge: string[] = [];
+  const remoteDeletes: string[] = [];
   const now = Date.now();
+  const total = files.length + remote.size;
 
   for (const file of files) {
     const fileId = ready.keys
@@ -85,6 +88,13 @@ export async function pushVault(plugin: E2eeSyncPlugin): Promise<string> {
     const remoteFile = remote.get(fileId);
     const plain = new Uint8Array(await plugin.app.vault.readBinary(file));
     const mac = ready.keys ? await contentMac(ready.keys.idKey, plain) : await plainMac(plain);
+    if (!remoteFile && cached && cached.contentMac === mac) {
+      await plugin.app.vault.delete(file);
+      delete index[fileId];
+      removed++;
+      plugin.setStatus(t("syncProgress", { done: uploaded + downloaded + unchanged + removed, total }));
+      continue;
+    }
     if (remoteFile?.contentMac === mac && remoteFile.encoding === encoding) {
       index[fileId] = { path: file.path, mtime: file.stat.mtime, size: file.stat.size, contentMac: mac, encoding, syncedAt: cached?.syncedAt ?? now };
       unchanged++;
@@ -93,7 +103,7 @@ export async function pushVault(plugin: E2eeSyncPlugin): Promise<string> {
     if (remoteFile && remoteFile.mtime > file.stat.mtime) {
       if (await pullRemote(plugin, ready, remoteFile, index)) downloaded++;
       else unchanged++;
-      plugin.setStatus(t("syncProgress", { done: uploaded + downloaded + unchanged, total: files.length + remote.size }));
+      plugin.setStatus(t("syncProgress", { done: uploaded + downloaded + unchanged + removed, total }));
       continue;
     }
     if (file.stat.size > MAX_FILE_BYTES) {
@@ -116,23 +126,48 @@ export async function pushVault(plugin: E2eeSyncPlugin): Promise<string> {
     });
     index[fileId] = { path: file.path, mtime: file.stat.mtime, size: file.stat.size, contentMac: mac, encoding, syncedAt: Date.now() };
     uploaded++;
-    plugin.setStatus(t("syncProgress", { done: uploaded + downloaded + unchanged, total: files.length + remote.size }));
+    plugin.setStatus(t("syncProgress", { done: uploaded + downloaded + unchanged + removed, total }));
   }
 
+  for (const [fileId, cached] of Object.entries(index)) {
+    if (seen.has(fileId) || !shouldSync(plugin, cached.path)) continue;
+    if (plugin.app.vault.getAbstractFileByPath(cached.path) instanceof TFile) continue;
+    const remoteFile = remote.get(fileId);
+    if (!remoteFile) {
+      delete index[fileId];
+      continue;
+    }
+    const remoteNewer = remoteFile.mtime > cached.mtime && remoteFile.contentMac !== cached.contentMac;
+    if (remoteNewer) {
+      if (await pullRemote(plugin, ready, remoteFile, index)) downloaded++;
+      else unchanged++;
+      seen.add(fileId);
+      continue;
+    }
+    remoteDeletes.push(fileId);
+  }
+  if (remoteDeletes.length > 0) {
+    await ready.client.deleteObjects(ready.vaultName, remoteDeletes, files.length);
+    for (const fileId of remoteDeletes) delete index[fileId];
+    removed += remoteDeletes.length;
+  }
+  const dropped = new Set(remoteDeletes);
+
   for (const remoteFile of remote.values()) {
-    if (seen.has(remoteFile.fileId)) continue;
+    if (seen.has(remoteFile.fileId) || dropped.has(remoteFile.fileId)) continue;
     if (await pullRemote(plugin, ready, remoteFile, index)) downloaded++;
-    plugin.setStatus(t("syncProgress", { done: uploaded + downloaded + unchanged, total: files.length + remote.size }));
+    plugin.setStatus(t("syncProgress", { done: uploaded + downloaded + unchanged + removed, total }));
   }
 
   plugin.settings.index = index;
   const large = skippedLarge.length ? t("large", { n: skippedLarge.length }) : "";
+  const deleted = removed ? t("deleted", { n: removed }) : "";
   plugin.settings.lastSyncSummary = t("summary", {
     vault: ready.vaultName,
     uploaded,
     downloaded,
     unchanged,
-    large,
+    large: `${deleted}${large}`,
   });
   await plugin.saveSettings();
   return plugin.settings.lastSyncSummary;
@@ -170,7 +205,7 @@ function shouldSync(plugin: E2eeSyncPlugin, path: string): boolean {
   const normalized = path.replaceAll("\\", "/");
   if (PLUGIN_FILES.has(normalized)) return true;
   if (!isSyncablePath(normalized)) return false;
-  return suffixSelected(normalized, plugin.settings.syncSuffixes, plugin.settings.syncOther);
+  return suffixSelected(normalized, plugin.settings.syncSuffixes, plugin.settings.syncOther, plugin.settings.customSuffixes);
 }
 
 export async function restoreVault(

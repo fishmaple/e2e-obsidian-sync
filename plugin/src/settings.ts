@@ -7,7 +7,7 @@ import { canSealSecrets } from "./local-secret";
 import { sharedConfigProblem } from "./shared-config";
 import { promptBind } from "./bind-prompt";
 import { hasActiveBinding } from "./binding";
-import { FILE_GROUPS } from "./file-kinds";
+import { FILE_GROUPS, isKnownSuffix, normalizeSuffix } from "./file-kinds";
 import type E2eeSyncPlugin from "./main";
 
 export class E2eeSettingTab extends PluginSettingTab {
@@ -23,7 +23,6 @@ export class E2eeSettingTab extends PluginSettingTab {
     containerEl.empty();
     containerEl.createEl("h2", { text: t("title") });
     containerEl.createEl("p", { text: t("intro"), cls: "e2ee-sync-status-line" });
-    containerEl.createEl("p", { text: t("dontCommit"), cls: "e2ee-sync-status-line" });
     if (!canSealSecrets()) containerEl.createEl("p", { text: t("secretsPlain"), cls: "e2ee-sync-status-line" });
     if (sharedConfigProblem()) containerEl.createEl("p", { text: t("sharedMissing"), cls: "e2ee-sync-status-line" });
 
@@ -199,9 +198,9 @@ export class E2eeSettingTab extends PluginSettingTab {
     }
     void this.refreshBinding();
 
-    new Setting(containerEl)
+    const autoSync = new Setting(containerEl)
       .setName(t("autoSync"))
-      .setDesc(t("autoSyncDesc"))
+      .setDesc(autoSyncText(this.plugin))
       .addToggle((toggle) => {
         toggle.setValue(this.plugin.settings.autoSync).onChange(async (value) => {
           this.plugin.settings.autoSync = value;
@@ -221,12 +220,8 @@ export class E2eeSettingTab extends PluginSettingTab {
             this.plugin.reschedule();
           });
       });
-
-    const lastSync = new Setting(containerEl)
-      .setName(t("lastSync"))
-      .setDesc(lastSyncText(this.plugin));
     this.plugin.onSyncMeta = () => {
-      lastSync.setDesc(lastSyncText(this.plugin));
+      autoSync.setDesc(autoSyncText(this.plugin));
     };
 
     new Setting(containerEl)
@@ -395,10 +390,10 @@ export class E2eeSettingTab extends PluginSettingTab {
   }
 }
 
-function lastSyncText(plugin: E2eeSyncPlugin): string {
+function autoSyncText(plugin: E2eeSyncPlugin): string {
   const at = plugin.settings.lastSyncAt;
-  if (!at) return t("notSynced");
-  return formatSyncTime(at);
+  const time = at ? formatSyncTime(at) : t("notSynced");
+  return `${t("autoSyncDesc")}\n${t("lastSyncLine", { time })}`;
 }
 
 function formatSyncTime(ms: number): string {
@@ -417,11 +412,14 @@ function confirmEncrypt(app: App): Promise<boolean> {
 class SyncTypesModal extends Modal {
   private selected = new Set<string>();
   private includeOther = true;
+  private custom: string[] = [];
+  private customBox: HTMLElement | null = null;
 
   constructor(app: App, private readonly plugin: E2eeSyncPlugin, private readonly done: () => void) {
     super(app);
     this.selected = new Set(plugin.settings.syncSuffixes);
     this.includeOther = plugin.settings.syncOther;
+    this.custom = [...plugin.settings.customSuffixes];
   }
 
   onOpen(): void {
@@ -438,16 +436,32 @@ class SyncTypesModal extends Modal {
       this.contentEl.createEl("h3", { text: names[group.id] });
       const grid = this.contentEl.createDiv({ cls: "e2ee-sync-suffixes" });
       for (const suffix of group.suffixes) {
-        const label = grid.createEl("label", { cls: "e2ee-sync-check" });
-        const input = label.createEl("input", { type: "checkbox" });
-        input.checked = this.selected.has(suffix);
-        input.onchange = () => {
-          if (input.checked) this.selected.add(suffix);
-          else this.selected.delete(suffix);
-        };
-        label.createSpan({ text: `.${suffix}` });
+        this.suffixCheck(grid, suffix);
       }
     }
+    this.contentEl.createEl("h3", { text: t("customSuffixes") });
+    this.contentEl.createEl("p", { text: t("customSuffixDesc"), cls: "e2ee-sync-status-line" });
+    this.customBox = this.contentEl.createDiv({ cls: "e2ee-sync-suffixes" });
+    this.renderCustom();
+    const addRow = this.contentEl.createDiv({ cls: "e2ee-sync-name" });
+    const input = addRow.createEl("input", { type: "text" });
+    input.placeholder = "mdx";
+    const add = addRow.createEl("button", { text: t("addSuffix") });
+    add.onclick = () => {
+      const suffix = normalizeSuffix(input.value);
+      if (!suffix) {
+        new Notice(t("badSuffix"));
+        return;
+      }
+      if (isKnownSuffix(suffix)) {
+        new Notice(t("suffixKnown"));
+        return;
+      }
+      if (!this.custom.includes(suffix)) this.custom.push(suffix);
+      this.selected.add(suffix);
+      input.value = "";
+      this.renderCustom();
+    };
     this.contentEl.createEl("h3", { text: t("groupOther") });
     const other = this.contentEl.createEl("label", { cls: "e2ee-sync-check" });
     const otherInput = other.createEl("input", { type: "checkbox" });
@@ -463,7 +477,33 @@ class SyncTypesModal extends Modal {
     cancel.onclick = () => this.close();
   }
 
+  private suffixCheck(grid: HTMLElement, suffix: string, removable = false): void {
+    const row = grid.createDiv({ cls: "e2ee-sync-check" });
+    const label = row.createEl("label", { cls: "e2ee-sync-check" });
+    const input = label.createEl("input", { type: "checkbox" });
+    input.checked = this.selected.has(suffix);
+    input.onchange = () => {
+      if (input.checked) this.selected.add(suffix);
+      else this.selected.delete(suffix);
+    };
+    label.createSpan({ text: `.${suffix}` });
+    if (!removable) return;
+    const remove = row.createEl("button", { text: t("removeSuffix") });
+    remove.onclick = () => {
+      this.custom = this.custom.filter((item) => item !== suffix);
+      this.selected.delete(suffix);
+      this.renderCustom();
+    };
+  }
+
+  private renderCustom(): void {
+    if (!this.customBox) return;
+    this.customBox.empty();
+    for (const suffix of this.custom) this.suffixCheck(this.customBox, suffix, true);
+  }
+
   private async save(): Promise<void> {
+    this.plugin.settings.customSuffixes = [...this.custom];
     this.plugin.settings.syncSuffixes = [...this.selected];
     this.plugin.settings.syncOther = this.includeOther;
     await this.plugin.saveSettings();

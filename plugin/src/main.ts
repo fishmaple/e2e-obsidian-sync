@@ -41,6 +41,7 @@ export interface SyncSettings {
   autoSync: boolean;
   autoSyncSeconds: number;
   syncSuffixes: string[];
+  customSuffixes: string[];
   syncOther: boolean;
   lastSyncAt: number | null;
   lastSyncSummary: string;
@@ -63,6 +64,7 @@ const DEFAULT_SETTINGS: SyncSettings = {
   autoSync: true,
   autoSyncSeconds: 30,
   syncSuffixes: allSuffixes(),
+  customSuffixes: [],
   syncOther: true,
   lastSyncAt: null,
   lastSyncSummary: "",
@@ -170,9 +172,15 @@ export default class E2eeSyncPlugin extends Plugin {
       this.settings.autoSyncSeconds = clampAutoSyncSeconds(this.settings.autoSyncSeconds);
     }
     const known = new Set(allSuffixes());
+    const storedCustom = rest.customSuffixes;
+    const custom = Array.isArray(storedCustom)
+      ? [...new Set(storedCustom.filter((item): item is string => typeof item === "string" && !known.has(item) && /^[a-z0-9]{1,16}$/.test(item)))]
+      : [];
+    this.settings.customSuffixes = custom;
+    const allowed = new Set([...known, ...custom]);
     const storedSuffixes = rest.syncSuffixes;
     this.settings.syncSuffixes = Array.isArray(storedSuffixes)
-      ? storedSuffixes.filter((item): item is string => typeof item === "string" && known.has(item))
+      ? storedSuffixes.filter((item): item is string => typeof item === "string" && allowed.has(item))
       : allSuffixes();
     if (typeof rest.syncOther !== "boolean") this.settings.syncOther = true;
     this.settings.index ??= {};

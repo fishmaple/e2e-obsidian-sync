@@ -24,8 +24,19 @@ export function fileSuffix(path: string): string {
   return base.slice(dot + 1).toLowerCase();
 }
 
-export function suffixSelected(path: string, selected: string[], includeOther: boolean): boolean {
+export function normalizeSuffix(input: string): string {
+  const suffix = input.trim().toLowerCase().replace(/^\.+/, "");
+  if (!/^[a-z0-9]{1,16}$/.test(suffix)) return "";
+  return suffix;
+}
+
+export function isKnownSuffix(suffix: string): boolean {
+  return KNOWN.has(suffix);
+}
+
+export function suffixSelected(path: string, selected: string[], includeOther: boolean, custom: string[] = []): boolean {
   const suffix = fileSuffix(path);
+  if (suffix && custom.includes(suffix)) return selected.includes(suffix);
   if (!suffix || !KNOWN.has(suffix)) return includeOther;
   return selected.includes(suffix);
 }
