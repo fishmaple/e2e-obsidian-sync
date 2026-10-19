@@ -2,7 +2,8 @@ node_modules/
 dist/
 *.log
 .env
-server/
+server-core/data/
+server-core/.deploy.local.env
 plugin/main.js
 plugin/main.js.map
 .DS_Store
