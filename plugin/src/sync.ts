@@ -262,7 +262,7 @@ export async function restoreVault(
     installPluginCopy(plugin, destination);
     writeBoundSettings(destination, vaultName, vaultId, needsKey, plugin.settings.accountId);
     registerVault(destination);
-    openExternal(`obsidian://open?path=${encodeURIComponent(destination)}`);
+    openCreatedVault(plugin, destination);
   }
   plugin.settings.lastSyncSummary = mode === "create"
     ? t("openedVault", { vault: vaultName, path: destination, count: restored })
@@ -274,6 +274,8 @@ export async function restoreVault(
 export class RestoreModal extends Modal {
   private selected = "";
   private vaults: VaultStat[] = [];
+  private keyBox: HTMLElement | null = null;
+  private keyInput: HTMLInputElement | null = null;
 
   constructor(app: App, private readonly plugin: E2eeSyncPlugin) {
     super(app);
@@ -314,16 +316,23 @@ export class RestoreModal extends Modal {
       const row = list.createDiv({ cls: "e2ee-sync-vault" });
       row.createEl("div", { text: vault.name });
       row.createEl("div", {
-        text: t("vaultMeta", { files: vault.files, bytes: formatBytes(vault.bytes), time: formatStamp(vault.lastSyncAt) }),
+        text: `${t("vaultMeta", { files: vault.files, bytes: formatBytes(vault.bytes), time: formatStamp(vault.lastSyncAt) })} · ${vault.encrypted ? t("encryptedLabel") : t("plainLabel")}`,
         cls: "e2ee-sync-status-line",
       });
       row.onclick = () => {
         this.selected = vault.id;
         for (const item of rows) item.toggleClass("is-selected", item === row);
+        this.refreshKey();
       };
       rows.push(row);
     }
     rows[0]?.addClass("is-selected");
+    this.keyBox = this.contentEl.createDiv({ cls: "e2ee-sync-name" });
+    this.keyBox.createEl("div", { text: t("restoreKey") });
+    this.keyBox.createEl("p", { text: t("restoreKeyDesc"), cls: "e2ee-sync-status-line" });
+    this.keyInput = this.keyBox.createEl("input", { type: "password" });
+    this.keyInput.value = this.plugin.settings.secretKey;
+    this.refreshKey();
     const actions = this.contentEl.createDiv({ cls: "e2ee-sync-actions" });
     const overwrite = actions.createEl("button", { text: t("overwrite"), cls: "mod-warning" });
     overwrite.onclick = () => this.choose("overwrite");
@@ -333,16 +342,34 @@ export class RestoreModal extends Modal {
     cancel.onclick = () => this.close();
   }
 
+  private refreshKey(): void {
+    const vault = this.vaults.find((item) => item.id === this.selected);
+    if (!this.keyBox) return;
+    this.keyBox.style.display = vault?.encrypted ? "" : "none";
+  }
+
+  private async applyKey(remote: VaultStat): Promise<boolean> {
+    if (!remote.encrypted) return true;
+    const key = this.keyInput?.value.trim() ?? "";
+    if (key.length < MIN_SECRET_LENGTH) {
+      new Notice(t("needSecret"));
+      return false;
+    }
+    this.plugin.setSecret(key);
+    await this.plugin.saveSettings();
+    return true;
+  }
+
   private choose(mode: RestoreMode): void {
     const remote = this.vaults.find((vault) => vault.id === this.selected);
     if (!remote) return;
-    this.close();
-    void this.plugin.restoreNow(remote, mode);
+    void this.finish(remote, mode);
   }
 
   private async chooseCreate(): Promise<void> {
     const remote = this.vaults.find((vault) => vault.id === this.selected);
     if (!remote) return;
+    if (!await this.applyKey(remote)) return;
     const folder = await chooseRestoreFolder(this.app);
     if (!folder) return;
     const name = folderName(folder);
@@ -356,6 +383,12 @@ export class RestoreModal extends Modal {
     }
     this.close();
     void this.plugin.restoreNow(remote, "create", folder);
+  }
+
+  private async finish(remote: VaultStat, mode: RestoreMode): Promise<void> {
+    if (!await this.applyKey(remote)) return;
+    this.close();
+    void this.plugin.restoreNow(remote, mode);
   }
 }
 
@@ -599,6 +632,46 @@ function enablePlugin(fs: NodeFs, dest: string): void {
   if (list.includes("e2ee-sync")) return;
   list.push("e2ee-sync");
   fs.writeText(listPath, JSON.stringify(list, null, 2));
+}
+
+function openCreatedVault(plugin: E2eeSyncPlugin, dest: string): void {
+  try {
+    const electron = require("electron") as {
+      ipcRenderer?: { send?: (channel: string, ...args: unknown[]) => void };
+    };
+    electron.ipcRenderer?.send?.("vault-open", dest, false);
+  } catch (error) {
+    console.warn("Could not ask Obsidian to open the new vault", error);
+  }
+  new CreatedVaultModal(plugin.app, dest).open();
+}
+
+class CreatedVaultModal extends Modal {
+  constructor(app: App, private readonly folder: string) {
+    super(app);
+  }
+
+  onOpen(): void {
+    this.titleEl.setText(t("restoreCreatedTitle"));
+    this.contentEl.createEl("p", { text: t("restoreCreatedGuide", { path: this.folder }) });
+    const row = this.contentEl.createDiv({ cls: "e2ee-sync-actions" });
+    const open = row.createEl("button", { text: t("restoreOpenFolder"), cls: "mod-cta" });
+    open.onclick = () => revealFolder(this.folder);
+    const close = row.createEl("button", { text: t("cancel") });
+    close.onclick = () => this.close();
+  }
+}
+
+function revealFolder(folder: string): void {
+  try {
+    const shell = (require("electron") as {
+      shell?: { showItemInFolder?: (target: string) => void; openPath?: (target: string) => Promise<string> };
+    }).shell;
+    if (shell?.showItemInFolder) shell.showItemInFolder(folder);
+    else void shell?.openPath?.(folder);
+  } catch (error) {
+    console.warn("Could not show the new vault folder", error);
+  }
 }
 
 function registerVault(dest: string): void {

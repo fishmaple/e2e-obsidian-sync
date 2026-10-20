@@ -450,6 +450,22 @@ export class SyncDb {
     return typeof row.content === "string" ? row.content : Buffer.from(row.content).toString("utf8");
   }
 
+  async deleteVault(accountId: string, vaultId: string): Promise<string[] | undefined> {
+    const vault = await this.findVaultById(accountId, vaultId);
+    if (!vault) return undefined;
+    const files = await this.listObjects(accountId, vault.name);
+    await this.sql.exec("BEGIN");
+    try {
+      await this.sql.run("DELETE FROM objects WHERE account_id = ? AND vault_name = ?", [accountId, vault.name]);
+      await this.sql.run("DELETE FROM vault_policies WHERE account_id = ? AND vault_id = ?", [accountId, vaultId]);
+      await this.sql.exec("COMMIT");
+    } catch (error) {
+      await this.sql.exec("ROLLBACK");
+      throw error;
+    }
+    return files.map((file) => file.fileId);
+  }
+
   async deleteBlob(accountId: string, fileId: string): Promise<void> {
     await this.sql.run("DELETE FROM blobs WHERE account_id = ? AND file_id = ?", [accountId, fileId]);
   }

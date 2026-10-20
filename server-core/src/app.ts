@@ -318,6 +318,16 @@ export function createApp(deps: AppDeps): Hono {
     return c.json(vault ?? { id: created, name, files: 0, bytes: 0, lastSyncAt: 0, encrypted: body.encrypted === true });
   });
 
+  api.delete("/vaults/:vaultId", async (c) => {
+    const { accountId } = await requireToken(c);
+    const vaultId = c.req.param("vaultId").trim();
+    if (!/^[0-9a-f-]{36}$/i.test(vaultId)) throw new HttpError(400, "Invalid vault id");
+    const removed = await db.deleteVault(accountId, vaultId);
+    if (!removed) throw new HttpError(404, "The remote vault does not exist");
+    for (const fileId of removed) await blobs.delete(accountId, fileId);
+    return c.json({ ok: true, deleted: removed.length });
+  });
+
   api.get("/manifest", async (c) => {
     const { accountId } = await requireToken(c);
     const key = (c.req.query("vault") ?? "").trim();
@@ -629,7 +639,7 @@ function parseCipher(value: unknown, requireEncryption: boolean): PayloadCipher 
   const record = value as { v?: unknown; iv?: unknown; ct?: unknown; raw?: unknown };
   if (record.v === 0) {
     if (requireEncryption) throw new HttpError(400, "The server requires encryption and rejected plaintext");
-    if (typeof record.raw !== "string" || !record.raw || record.raw.length > MAX_BODY_BYTES) {
+    if (typeof record.raw !== "string" || record.raw.length > MAX_BODY_BYTES) {
       throw new HttpError(400, "Invalid plaintext");
     }
     return { v: 0, raw: record.raw };

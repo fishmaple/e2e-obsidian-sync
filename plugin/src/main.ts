@@ -381,14 +381,25 @@ export default class E2eeSyncPlugin extends Plugin {
 
   reschedule(): void {
     this.stopTimer?.();
-    this.stopTimer = null;
-    if (!this.settings.autoSync) return;
-    const seconds = clampAutoSyncSeconds(this.settings.autoSyncSeconds);
-    this.settings.autoSyncSeconds = seconds;
-    const timer = window.setInterval(() => {
-      void this.syncNow(false);
-    }, seconds * 1000);
-    this.stopTimer = () => window.clearInterval(timer);
+    this.armAutoTimer();
+  }
+
+  private armAutoTimer(): void {
+    if (!this.settings.autoSync) {
+      this.stopTimer = null;
+      return;
+    }
+    const wait = clampAutoSyncSeconds(this.settings.autoSyncSeconds);
+    this.settings.autoSyncSeconds = wait;
+    let cancel: (() => void) | null = null;
+    const timer = window.setTimeout(() => {
+      void this.syncNow(false).finally(() => {
+        if (this.stopTimer !== cancel) return;
+        this.armAutoTimer();
+      });
+    }, wait * 1000);
+    cancel = () => window.clearTimeout(timer);
+    this.stopTimer = cancel;
   }
 
   setStatus(text: string): void {
@@ -431,8 +442,10 @@ export default class E2eeSyncPlugin extends Plugin {
 
   async syncNow(manual: boolean): Promise<boolean> {
     if (this.syncing) {
-      this.pending = true;
-      if (manual) new Notice(t("syncing"));
+      if (manual) {
+        this.pending = true;
+        new Notice(t("syncing"));
+      }
       return false;
     }
     if (!this.settings.apiToken.trim()) {
