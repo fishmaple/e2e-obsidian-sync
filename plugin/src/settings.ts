@@ -180,15 +180,6 @@ export class E2eeSettingTab extends PluginSettingTab {
     const vaults = new Setting(containerEl)
       .setName(t("vaultList"))
       .setDesc(bindingText(this.plugin));
-    if (bound) {
-      vaults.descEl.createDiv({
-        text: t("remoteId", { id: this.plugin.settings.boundVaultId }),
-        cls: "e2ee-sync-status-line",
-      });
-      vaults.addButton((button) => {
-        button.setButtonText(t("openRemote")).onClick(() => { void this.openRemote(); });
-      });
-    }
     if (this.plugin.settings.apiToken.trim()) {
       vaults.addButton((button) => {
         button.setButtonText(t("manageVaults")).onClick(() => {
@@ -197,8 +188,12 @@ export class E2eeSettingTab extends PluginSettingTab {
       });
     }
     if (bound) {
+      vaults.descEl.createDiv({
+        text: t("remoteId", { id: this.plugin.settings.boundVaultId }),
+        cls: "e2ee-sync-status-line",
+      });
       vaults.addButton((button) => {
-        button.setButtonText(t("unbind")).onClick(() => { this.confirmUnbind(); });
+        button.setButtonText(t("openRemote")).onClick(() => { void this.openRemote(); });
       });
     } else if (this.plugin.settings.apiToken.trim()) {
       vaults.addButton((button) => {
@@ -302,21 +297,6 @@ export class E2eeSettingTab extends PluginSettingTab {
     await this.plugin.saveSettings();
     this.plugin.refreshRibbon();
     new Notice(t("loggedOut"));
-    this.display();
-  }
-
-  private confirmUnbind(): void {
-    const name = this.plugin.settings.boundVault;
-    new UnbindConfirm(this.app, name, (ok) => {
-      if (ok) void this.unbind();
-    }).open();
-  }
-
-  private async unbind(): Promise<void> {
-    const accountId = this.plugin.settings.accountId;
-    if (accountId) delete this.plugin.settings.vaultBindings[accountId];
-    this.plugin.clearBinding();
-    await this.plugin.saveSettings();
     this.display();
   }
 
@@ -572,7 +552,11 @@ class VaultManageModal extends Modal {
       const actions = row.createDiv({ cls: "e2ee-sync-actions" });
       if (!current) {
         const rebind = actions.createEl("button", { text: t("rebind") });
-        rebind.onclick = () => { void this.rebind(vault); };
+        rebind.onclick = () => {
+          new RebindConfirm(this.app, vault.name, (ok) => {
+            if (ok) void this.rebind(vault);
+          }).open();
+        };
       }
       const remove = actions.createEl("button", { text: t("deleteVault"), cls: "mod-warning" });
       remove.onclick = () => {
@@ -658,7 +642,7 @@ function bindingText(plugin: E2eeSyncPlugin): string {
   return t("remoteBound", { name: plugin.settings.boundVault });
 }
 
-class UnbindConfirm extends Modal {
+class RebindConfirm extends Modal {
   private settled = false;
 
   constructor(app: App, private readonly vaultName: string, private readonly choose: (ok: boolean) => void) {
@@ -666,10 +650,10 @@ class UnbindConfirm extends Modal {
   }
 
   onOpen(): void {
-    this.titleEl.setText(t("unbindTitle"));
-    this.contentEl.createEl("p", { text: t("unbindBody", { name: this.vaultName }) });
+    this.titleEl.setText(t("rebindTitle"));
+    this.contentEl.createEl("p", { text: t("rebindBody", { name: this.vaultName }) });
     const row = this.contentEl.createDiv({ cls: "e2ee-sync-actions" });
-    const ok = row.createEl("button", { text: t("unbind"), cls: "mod-warning" });
+    const ok = row.createEl("button", { text: t("rebind"), cls: "mod-warning" });
     ok.onclick = () => this.finish(true);
     const cancel = row.createEl("button", { text: t("cancel") });
     cancel.onclick = () => this.finish(false);
