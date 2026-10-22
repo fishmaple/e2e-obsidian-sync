@@ -1,6 +1,6 @@
 import { Modal, Notice, PluginSettingTab, Setting, type App } from "obsidian";
 import { bytesToBase64Url, randomBytes, randomSecret } from "../../shared/src/codec";
-import { PUBLIC_SERVER_HOST } from "../../shared/src/protocol";
+import { PUBLIC_SERVER_HOST, type VaultStat } from "../../shared/src/protocol";
 import { SyncClient, fetchBootstrap, fetchHealth, openExternal, resolveSyncHost } from "./client";
 import { t } from "./i18n";
 import { canSealSecrets } from "./local-secret";
@@ -180,6 +180,13 @@ export class E2eeSettingTab extends PluginSettingTab {
     const vaults = new Setting(containerEl)
       .setName(t("vaultList"))
       .setDesc(bindingText(this.plugin));
+    if (this.plugin.settings.apiToken.trim()) {
+      vaults.addButton((button) => {
+        button.setButtonText(t("manageVaults")).onClick(() => {
+          new VaultManageModal(this.app, this.plugin, () => this.display()).open();
+        });
+      });
+    }
     if (bound) {
       vaults.descEl.createDiv({
         text: t("remoteId", { id: this.plugin.settings.boundVaultId }),
@@ -187,9 +194,6 @@ export class E2eeSettingTab extends PluginSettingTab {
       });
       vaults.addButton((button) => {
         button.setButtonText(t("openRemote")).onClick(() => { void this.openRemote(); });
-      });
-      vaults.addButton((button) => {
-        button.setButtonText(t("unbind")).onClick(() => { this.confirmUnbind(); });
       });
     } else if (this.plugin.settings.apiToken.trim()) {
       vaults.addButton((button) => {
@@ -210,15 +214,23 @@ export class E2eeSettingTab extends PluginSettingTab {
       })
       .addText((text) => {
         text.setPlaceholder("30")
-          .setValue(String(this.plugin.settings.autoSyncSeconds))
-          .onChange(async (value) => {
-            const seconds = Number(value);
-            if (!Number.isInteger(seconds) || seconds < 30 || seconds > 86400) return;
-            if (seconds === this.plugin.settings.autoSyncSeconds) return;
-            this.plugin.settings.autoSyncSeconds = seconds;
-            await this.plugin.saveSettings();
-            this.plugin.reschedule();
-          });
+          .setValue(String(this.plugin.settings.autoSyncSeconds));
+        const apply = async (value: string, snap: boolean) => {
+          const raw = Number(value.trim());
+          if (!Number.isFinite(raw) || !Number.isInteger(raw)) return;
+          if (!snap && (raw < 30 || raw > 86400)) return;
+          const seconds = Math.min(86400, Math.max(30, Math.floor(raw)));
+          if (snap && String(seconds) !== value.trim()) {
+            text.setValue(String(seconds));
+            if (raw < 30) new Notice(t("autoSyncMin", { n: seconds }));
+          }
+          if (seconds === this.plugin.settings.autoSyncSeconds) return;
+          this.plugin.settings.autoSyncSeconds = seconds;
+          await this.plugin.saveSettings();
+          this.plugin.reschedule();
+        };
+        text.onChange((value) => { void apply(value, false); });
+        text.inputEl.addEventListener("change", () => { void apply(text.getValue(), true); });
       });
     this.plugin.onSyncMeta = () => {
       autoSync.setDesc(autoSyncText(this.plugin));
@@ -285,21 +297,6 @@ export class E2eeSettingTab extends PluginSettingTab {
     await this.plugin.saveSettings();
     this.plugin.refreshRibbon();
     new Notice(t("loggedOut"));
-    this.display();
-  }
-
-  private confirmUnbind(): void {
-    const name = this.plugin.settings.boundVault;
-    new UnbindConfirm(this.app, name, (ok) => {
-      if (ok) void this.unbind();
-    }).open();
-  }
-
-  private async unbind(): Promise<void> {
-    const accountId = this.plugin.settings.accountId;
-    if (accountId) delete this.plugin.settings.vaultBindings[accountId];
-    this.plugin.clearBinding();
-    await this.plugin.saveSettings();
     this.display();
   }
 
@@ -513,13 +510,91 @@ class SyncTypesModal extends Modal {
   }
 }
 
-function bindingText(plugin: E2eeSyncPlugin): string {
-  if (!plugin.settings.apiToken.trim()) return t("notLoggedIn");
-  if (!hasActiveBinding(plugin.settings)) return t("remoteUnbound");
-  return t("remoteBound", { name: plugin.settings.boundVault });
+class VaultManageModal extends Modal {
+  constructor(app: App, private readonly plugin: E2eeSyncPlugin, private readonly done: () => void) {
+    super(app);
+  }
+
+  onOpen(): void {
+    this.titleEl.setText(t("manageVaultsTitle"));
+    this.contentEl.setText(t("loadingVaults"));
+    void this.load();
+  }
+
+  private async load(): Promise<void> {
+    try {
+      const token = this.plugin.settings.apiToken.trim();
+      if (!token) throw new Error(t("needLogin"));
+      const host = resolveSyncHost(this.plugin.settings.host);
+      const listed = await new SyncClient(host, token).vaults();
+      this.render(listed.vaults.filter((vault) => vault.id && vault.name));
+    } catch (error) {
+      this.contentEl.empty();
+      this.contentEl.createEl("p", { text: error instanceof Error ? error.message : t("readFailed") });
+    }
+  }
+
+  private render(vaults: VaultStat[]): void {
+    this.contentEl.empty();
+    if (vaults.length === 0) {
+      this.contentEl.createEl("p", { text: t("manageVaultsEmpty") });
+      return;
+    }
+    const list = this.contentEl.createDiv({ cls: "e2ee-sync-vaults" });
+    for (const vault of vaults) {
+      const current = hasActiveBinding(this.plugin.settings) && vault.id === this.plugin.settings.boundVaultId;
+      const row = list.createDiv({ cls: "e2ee-sync-vault" });
+      row.createEl("div", { text: current ? `${vault.name} · ${t("currentRemote")}` : vault.name });
+      row.createEl("div", {
+        text: `${t("vaultMeta", { files: vault.files, bytes: formatBytes(vault.bytes), time: formatStamp(vault.lastSyncAt) })} · ${vault.encrypted ? t("encryptedLabel") : t("plainLabel")}`,
+        cls: "e2ee-sync-status-line",
+      });
+      const actions = row.createDiv({ cls: "e2ee-sync-actions" });
+      if (!current) {
+        const rebind = actions.createEl("button", { text: t("rebind") });
+        rebind.onclick = () => {
+          new RebindConfirm(this.app, vault.name, (ok) => {
+            if (ok) void this.rebind(vault);
+          }).open();
+        };
+      }
+      const remove = actions.createEl("button", { text: t("deleteVault"), cls: "mod-warning" });
+      remove.onclick = () => {
+        new DeleteVaultConfirm(this.app, vault.name, (ok) => {
+          if (ok) void this.remove(vault);
+        }).open();
+      };
+    }
+  }
+
+  private async rebind(vault: VaultStat): Promise<void> {
+    await this.plugin.bindVault(vault.name, vault.encrypted, vault.id);
+    new Notice(t("rebindDone", { name: vault.name }));
+    this.close();
+    this.done();
+  }
+
+  private async remove(vault: VaultStat): Promise<void> {
+    try {
+      const token = this.plugin.settings.apiToken.trim();
+      if (!token) throw new Error(t("needLogin"));
+      await new SyncClient(resolveSyncHost(this.plugin.settings.host), token).deleteVault(vault.id);
+      if (this.plugin.settings.boundVaultId === vault.id) {
+        const accountId = this.plugin.settings.accountId;
+        if (accountId) delete this.plugin.settings.vaultBindings[accountId];
+        this.plugin.clearBinding();
+        await this.plugin.saveSettings();
+      }
+      new Notice(t("deleteVaultDone", { name: vault.name }));
+      this.done();
+      await this.load();
+    } catch (error) {
+      new Notice(error instanceof Error ? error.message : t("syncFailed"));
+    }
+  }
 }
 
-class UnbindConfirm extends Modal {
+class DeleteVaultConfirm extends Modal {
   private settled = false;
 
   constructor(app: App, private readonly vaultName: string, private readonly choose: (ok: boolean) => void) {
@@ -527,10 +602,58 @@ class UnbindConfirm extends Modal {
   }
 
   onOpen(): void {
-    this.titleEl.setText(t("unbindTitle"));
-    this.contentEl.createEl("p", { text: t("unbindBody", { name: this.vaultName }) });
+    this.titleEl.setText(t("deleteVaultTitle"));
+    this.contentEl.createEl("p", { text: t("deleteVaultBody", { name: this.vaultName }) });
     const row = this.contentEl.createDiv({ cls: "e2ee-sync-actions" });
-    const ok = row.createEl("button", { text: t("unbind"), cls: "mod-warning" });
+    const ok = row.createEl("button", { text: t("deleteVault"), cls: "mod-warning" });
+    ok.onclick = () => this.finish(true);
+    const cancel = row.createEl("button", { text: t("cancel") });
+    cancel.onclick = () => this.finish(false);
+  }
+
+  onClose(): void {
+    this.finish(false);
+  }
+
+  private finish(ok: boolean): void {
+    if (this.settled) return;
+    this.settled = true;
+    this.choose(ok);
+    this.close();
+  }
+}
+
+function formatBytes(value: number): string {
+  if (!Number.isFinite(value) || value < 1024) return `${Math.max(0, Math.round(value))} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  return `${(value / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function formatStamp(ms: number): string {
+  if (!ms) return t("notSynced");
+  const date = new Date(ms);
+  const pad = (part: number) => String(part).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function bindingText(plugin: E2eeSyncPlugin): string {
+  if (!plugin.settings.apiToken.trim()) return t("notLoggedIn");
+  if (!hasActiveBinding(plugin.settings)) return t("remoteUnbound");
+  return t("remoteBound", { name: plugin.settings.boundVault });
+}
+
+class RebindConfirm extends Modal {
+  private settled = false;
+
+  constructor(app: App, private readonly vaultName: string, private readonly choose: (ok: boolean) => void) {
+    super(app);
+  }
+
+  onOpen(): void {
+    this.titleEl.setText(t("rebindTitle"));
+    this.contentEl.createEl("p", { text: t("rebindBody", { name: this.vaultName }) });
+    const row = this.contentEl.createDiv({ cls: "e2ee-sync-actions" });
+    const ok = row.createEl("button", { text: t("rebind"), cls: "mod-warning" });
     ok.onclick = () => this.finish(true);
     const cancel = row.createEl("button", { text: t("cancel") });
     cancel.onclick = () => this.finish(false);

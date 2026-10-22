@@ -321,9 +321,21 @@ test("a plaintext vault accepts uploads until encryption is locked, and logout r
     assert.match(createdBody.id, /^[0-9a-f-]{36}$/i);
     const duplicate = await authed(app, apiToken, "POST", "/api/v1/vaults", { name: "新库", create: true });
     assert.equal(duplicate.status, 409);
+    const temporary = await authed(app, apiToken, "POST", "/api/v1/vaults", { name: "临时", create: true });
+    const temporaryId = (await temporary.json() as { id: string }).id;
+    const removedVault = await authed(app, apiToken, "DELETE", `/api/v1/vaults/${temporaryId}`);
+    assert.equal(removedVault.status, 200);
 
     const put = await authed(app, apiToken, "PUT", `/api/v1/objects/${fileId}`, plain);
     assert.equal(put.status, 200, await put.text());
+    const emptyId = "ac".repeat(32);
+    const emptyPut = await authed(app, apiToken, "PUT", `/api/v1/objects/${emptyId}`, {
+      ...plain,
+      contentCipher: { v: 0, raw: "" },
+      contentMac: "ce".repeat(32),
+      size: 0,
+    });
+    assert.equal(emptyPut.status, 200, await emptyPut.text());
 
     const secret = "this-is-a-long-secret";
     const keys = await deriveKeys(secret);
@@ -386,8 +398,8 @@ test("the home page links to install, and a remote vault can be marked encrypted
     assert.doesNotMatch(sh, /urlretrieve/);
     const latest = await app.request("http://127.0.0.1/plugin/e2ee-sync/latest");
     assert.equal(latest.status, 200);
-    assert.equal((await latest.text()).trim(), "0.3.0-beta");
-    const sums = await app.request("http://127.0.0.1/plugin/e2ee-sync/0.3.0-beta/SHA256SUMS");
+    assert.equal((await latest.text()).trim(), "0.3.1-beta");
+    const sums = await app.request("http://127.0.0.1/plugin/e2ee-sync/0.3.1-beta/SHA256SUMS");
     assert.equal(sums.status, 200);
     assert.match(await sums.text(), /[0-9a-f]{64}  main\.js/);
     const account = await app.request("http://127.0.0.1/install");

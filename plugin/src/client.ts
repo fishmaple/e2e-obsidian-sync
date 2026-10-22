@@ -86,6 +86,10 @@ export class SyncClient {
     return this.authed("POST", "/api/v1/deletions", { vault, ids, localCount, clearUnnamed });
   }
 
+  deleteVault(vaultId: string): Promise<{ ok: boolean; deleted: number }> {
+    return this.authed("DELETE", `/api/v1/vaults/${encodeURIComponent(vaultId)}`);
+  }
+
   webSession(): Promise<{ code: string }> {
     return this.authed("POST", "/api/v1/web-session");
   }
