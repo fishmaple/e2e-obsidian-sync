@@ -1,12 +1,15 @@
 import { FileSystemAdapter, Modal, Notice, TFile, type App, type Vault } from "obsidian";
 import { bytesToBase64, randomBytes } from "../../shared/src/codec";
 import { contentMac, deriveKeys, fileIdForPath, openBytes, plainFileId, plainMac, sealBytes } from "../../shared/src/crypto";
-import { MAX_FILE_BYTES, MIN_SECRET_LENGTH, type Encoding, type RemoteFile, type VaultStat } from "../../shared/src/protocol";
-import { SyncClient, fetchBootstrap, openExternal, resolveSyncHost } from "./client";
+import { MAX_FILE_BYTES, MIN_SECRET_LENGTH, remoteRev, type ChangeEntry, type Encoding, type PutResult, type RemoteFile, type VaultStat } from "../../shared/src/protocol";
+import { decideSyncAction } from "../../shared/src/reconcile";
+import { SyncClient, SyncConflictError, fetchBootstrap, openExternal, resolveSyncHost } from "./client";
+import { askConflict, type ConflictChoice, type ConflictView } from "./conflict";
 import { suffixSelected } from "./file-kinds";
 import { t } from "./i18n";
 import { isDesktopApp, obsidianConfigDir, warnMissingObsidianConfig } from "./obsidian-dir";
 import type E2eeSyncPlugin from "./main";
+import type { FileIndexEntry } from "./main";
 
 export type RestoreMode = "overwrite" | "create";
 
@@ -66,18 +69,20 @@ export async function pushVault(plugin: E2eeSyncPlugin): Promise<string> {
     if (boot.requireEncryption) throw new Error(t("serverEncrypt"));
   }
   const files = plugin.app.vault.getFiles().filter((file) => shouldSync(plugin, file.path));
-  const manifest = await ready.client.manifest(ready.vaultId);
-  const remote = new Map(manifest.files.map((file) => [file.fileId, file]));
+  const loaded = await loadRemote(plugin, ready);
+  const remote = loaded.remote;
   const seen = new Set<string>();
   const index = { ...plugin.settings.index };
+  const conflicts: PendingConflict[] = [];
   let uploaded = 0;
   let downloaded = 0;
   let unchanged = 0;
   let removed = 0;
+  let deferCursor = false;
   const skippedLarge: string[] = [];
   const remoteDeletes: string[] = [];
-  const now = Date.now();
   const total = files.length + remote.size;
+  const counts = () => uploaded + downloaded + unchanged + removed;
 
   for (const file of files) {
     const fileId = ready.keys
@@ -85,92 +90,635 @@ export async function pushVault(plugin: E2eeSyncPlugin): Promise<string> {
       : await plainFileId(ready.vaultName, file.path);
     seen.add(fileId);
     const cached = index[fileId];
-    const remoteFile = remote.get(fileId);
+    const remoteFile = remote.get(fileId) ?? null;
     const plain = new Uint8Array(await plugin.app.vault.readBinary(file));
-    const mac = ready.keys ? await contentMac(ready.keys.idKey, plain) : await plainMac(plain);
-    if (!remoteFile && cached && cached.contentMac === mac) {
-      await plugin.app.vault.delete(file);
-      delete index[fileId];
-      removed++;
-      plugin.setStatus(t("syncProgress", { done: uploaded + downloaded + unchanged + removed, total }));
-      continue;
-    }
-    if (remoteFile?.contentMac === mac && remoteFile.encoding === encoding) {
-      index[fileId] = { path: file.path, mtime: file.stat.mtime, size: file.stat.size, contentMac: mac, encoding, syncedAt: cached?.syncedAt ?? now };
+    const mac = await fingerprint(ready, plain);
+    const action = decideSyncAction({
+      local: { contentMac: mac, encoding },
+      remote: remoteSide(remoteFile),
+      base: baseOf(cached),
+    });
+    if (action.type === "unchanged") {
+      index[fileId] = syncedEntry(file.path, file.stat.mtime, file.stat.size, mac, encoding, remoteRev(remoteFile ?? {}) || cached?.rev);
       unchanged++;
       continue;
     }
-    if (remoteFile && remoteFile.mtime > file.stat.mtime) {
+    if (action.type === "delete-local") {
+      await plugin.app.vault.delete(file);
+      delete index[fileId];
+      removed++;
+      plugin.setStatus(t("syncProgress", { done: counts(), total }));
+      continue;
+    }
+    if (action.type === "download") {
+      if (!remoteFile) continue;
+      if (remoteFile.size > MAX_FILE_BYTES) {
+        skippedLarge.push(file.path);
+        deferCursor = true;
+        continue;
+      }
       if (await pullRemote(plugin, ready, remoteFile, index)) downloaded++;
       else unchanged++;
-      plugin.setStatus(t("syncProgress", { done: uploaded + downloaded + unchanged + removed, total }));
+      plugin.setStatus(t("syncProgress", { done: counts(), total }));
       continue;
     }
-    if (file.stat.size > MAX_FILE_BYTES) {
-      skippedLarge.push(file.path);
+    if (action.type === "upload") {
+      if (plain.byteLength > MAX_FILE_BYTES) {
+        skippedLarge.push(file.path);
+        continue;
+      }
+      const outcome = await uploadTracked(plugin, ready, index, {
+        fileId,
+        path: file.path,
+        plain,
+        mac,
+        encoding,
+        mtime: file.stat.mtime,
+        size: file.stat.size,
+        parentRev: action.parentRev,
+        base: cached ?? null,
+        remote: remoteFile,
+      });
+      if (outcome === "uploaded") uploaded++;
+      else conflicts.push(outcome);
+      plugin.setStatus(t("syncProgress", { done: counts(), total }));
       continue;
     }
-    await ready.client.putObject(fileId, {
-      vault: ready.vaultName,
-      vaultId: ready.vaultId,
-      pathCipher: ready.keys
-        ? await sealBytes(ready.keys.encKey, new TextEncoder().encode(file.path), `path:${fileId}`, true)
-        : { v: 0, raw: bytesToBase64(new TextEncoder().encode(file.path)) },
-      contentCipher: ready.keys
-        ? await sealBytes(ready.keys.encKey, plain, `body:${fileId}`, true)
-        : { v: 0, raw: bytesToBase64(plain) },
-      contentMac: mac,
-      size: plain.byteLength,
-      mtime: file.stat.mtime,
-      encoding,
-    });
-    index[fileId] = { path: file.path, mtime: file.stat.mtime, size: file.stat.size, contentMac: mac, encoding, syncedAt: Date.now() };
-    uploaded++;
-    plugin.setStatus(t("syncProgress", { done: uploaded + downloaded + unchanged + removed, total }));
+    if (action.type === "conflict") {
+      if (plain.byteLength > MAX_FILE_BYTES || (remoteFile && remoteFile.size > MAX_FILE_BYTES)) {
+        skippedLarge.push(file.path);
+        deferCursor = true;
+        continue;
+      }
+      conflicts.push(await pendingConflict(ready, {
+        fileId,
+        path: file.path,
+        kind: action.kind === "local-deleted" ? "content" : action.kind,
+        localBytes: plain,
+        remote: remoteFile,
+        base: cached ?? null,
+        encoding,
+      }));
+      continue;
+    }
   }
 
   for (const [fileId, cached] of Object.entries(index)) {
     if (seen.has(fileId) || !shouldSync(plugin, cached.path)) continue;
     if (plugin.app.vault.getAbstractFileByPath(cached.path) instanceof TFile) continue;
-    const remoteFile = remote.get(fileId);
-    if (!remoteFile) {
+    const remoteFile = remote.get(fileId) ?? null;
+    const action = decideSyncAction({
+      local: null,
+      remote: remoteSide(remoteFile),
+      base: baseOf(cached),
+    });
+    if (action.type === "unchanged" || action.type === "delete-local") {
       delete index[fileId];
       continue;
     }
-    const remoteNewer = remoteFile.mtime > cached.mtime && remoteFile.contentMac !== cached.contentMac;
-    if (remoteNewer) {
-      if (await pullRemote(plugin, ready, remoteFile, index)) downloaded++;
-      else unchanged++;
+    if (action.type === "delete-remote") {
+      remoteDeletes.push(fileId);
       seen.add(fileId);
       continue;
     }
-    remoteDeletes.push(fileId);
+    if (action.type === "download" && remoteFile) {
+      seen.add(fileId);
+      if (remoteFile.size > MAX_FILE_BYTES) {
+        skippedLarge.push(cached.path);
+        deferCursor = true;
+        continue;
+      }
+      if (await pullRemote(plugin, ready, remoteFile, index)) downloaded++;
+      else unchanged++;
+      continue;
+    }
+    if (action.type === "conflict") {
+      seen.add(fileId);
+      if (remoteFile && remoteFile.size > MAX_FILE_BYTES) {
+        skippedLarge.push(cached.path);
+        deferCursor = true;
+        continue;
+      }
+      conflicts.push(await pendingConflict(ready, {
+        fileId,
+        path: cached.path,
+        kind: "local-deleted",
+        localBytes: null,
+        remote: remoteFile,
+        base: cached,
+        encoding,
+      }));
+    }
   }
+
   if (remoteDeletes.length > 0) {
     await ready.client.deleteObjects(ready.vaultName, remoteDeletes, files.length);
     for (const fileId of remoteDeletes) delete index[fileId];
     removed += remoteDeletes.length;
   }
-  const dropped = new Set(remoteDeletes);
 
   for (const remoteFile of remote.values()) {
-    if (seen.has(remoteFile.fileId) || dropped.has(remoteFile.fileId)) continue;
+    if (seen.has(remoteFile.fileId)) continue;
+    if (remoteFile.size > MAX_FILE_BYTES) {
+      skippedLarge.push(remoteFile.fileId);
+      deferCursor = true;
+      continue;
+    }
     if (await pullRemote(plugin, ready, remoteFile, index)) downloaded++;
-    plugin.setStatus(t("syncProgress", { done: uploaded + downloaded + unchanged + removed, total }));
+    plugin.setStatus(t("syncProgress", { done: counts(), total }));
   }
 
+  const device = deviceLabel();
+  let resolved = 0;
+  let unresolved = 0;
+  for (let i = 0; i < conflicts.length; i++) {
+    const item = conflicts[i];
+    if (!item) continue;
+    plugin.setStatus(t("conflictTitle", { index: i + 1, total: conflicts.length }));
+    const choice = await askConflict(plugin.app, conflictView(item, i + 1, conflicts.length));
+    const outcome = await applyConflict(plugin, ready, index, item, choice, device, encoding);
+    if (outcome === "resolved") {
+      resolved++;
+      if (choice.action === "remote" && item.kind !== "remote-deleted") downloaded++;
+      else if (choice.action === "local" && item.kind === "local-deleted") removed++;
+      else if (choice.action === "remote" && item.kind === "remote-deleted") removed++;
+      else if (choice.action === "both") uploaded += 2;
+      else uploaded++;
+    } else if (outcome === "unresolved") unresolved++;
+    else if ((outcome.attempt ?? 0) > 1) unresolved++;
+    else conflicts.push(outcome);
+  }
+  if (unresolved > 0) deferCursor = true;
+
   plugin.settings.index = index;
+  if (!deferCursor && loaded.cursor !== null) plugin.settings.changeCursor = loaded.cursor;
   const large = skippedLarge.length ? t("large", { n: skippedLarge.length }) : "";
   const deleted = removed ? t("deleted", { n: removed }) : "";
+  const resolvedNote = resolved ? t("conflictsResolved", { n: resolved }) : "";
+  const leftNote = unresolved ? t("conflictsLeft", { n: unresolved }) : "";
   plugin.settings.lastSyncSummary = t("summary", {
     vault: ready.vaultName,
     uploaded,
     downloaded,
     unchanged,
-    large: `${deleted}${large}`,
+    large: `${deleted}${large}${resolvedNote}${leftNote}`,
   });
   await plugin.saveSettings();
   return plugin.settings.lastSyncSummary;
+}
+
+interface PendingConflict {
+  fileId: string;
+  path: string;
+  kind: "content" | "remote-deleted" | "local-deleted";
+  localBytes: Uint8Array | null;
+  remoteBytes: Uint8Array | null;
+  remote: RemoteFile | null;
+  baseRev: number | null;
+  baseMac: string | null;
+  encoding: Encoding;
+  attempt?: number;
+}
+
+type ReadyClient = Awaited<ReturnType<typeof openClient>>;
+
+async function loadRemote(plugin: E2eeSyncPlugin, ready: ReadyClient): Promise<{ remote: Map<string, RemoteFile>; cursor: number | null }> {
+  const saved = plugin.settings.changeCursor;
+  if (typeof saved === "number" && indexReady(plugin.settings.index)) {
+    try {
+      const remote = remoteSnapshot(plugin.settings.index);
+      let since = saved;
+      let cursor = saved;
+      for (let pageNo = 0; pageNo < 100; pageNo++) {
+        const page = await ready.client.changes(ready.vaultId, since);
+        if (!page || !Array.isArray(page.changes) || typeof page.cursor !== "number") {
+          throw new Error("The changes response was incomplete");
+        }
+        for (const change of page.changes) applyChange(remote, change);
+        cursor = page.cursor;
+        if (!page.more || page.cursor <= since) return { remote, cursor: usableCursor(cursor, remote) };
+        since = page.cursor;
+      }
+      throw new Error("The change log is too long");
+    } catch (error) {
+      console.warn("Incremental sync failed; falling back to the full manifest", error);
+    }
+  }
+  const manifest = await ready.client.manifest(ready.vaultId);
+  const remote = new Map<string, RemoteFile>();
+  for (const file of manifest.files) remote.set(file.fileId, { ...file, rev: remoteRev(file) });
+  const cursor = typeof manifest.cursor === "number" && Number.isSafeInteger(manifest.cursor) && manifest.cursor >= 0
+    ? manifest.cursor
+    : null;
+  return { remote, cursor: usableCursor(cursor, remote) };
+}
+
+function indexReady(index: Record<string, FileIndexEntry>): boolean {
+  return Object.values(index).every((entry) =>
+    typeof entry.rev === "number" && entry.rev > 0 && (entry.encoding === "plain" || entry.encoding === "e2ee"));
+}
+
+function usableCursor(cursor: number | null, remote: Map<string, RemoteFile>): number | null {
+  if (cursor === null) return null;
+  for (const file of remote.values()) {
+    if (remoteRev(file) <= 0) return null;
+  }
+  return cursor;
+}
+
+function remoteSnapshot(index: Record<string, FileIndexEntry>): Map<string, RemoteFile> {
+  const remote = new Map<string, RemoteFile>();
+  for (const [fileId, entry] of Object.entries(index)) {
+    if (typeof entry.rev !== "number" || entry.rev <= 0) continue;
+    if (entry.encoding !== "plain" && entry.encoding !== "e2ee") continue;
+    remote.set(fileId, {
+      fileId,
+      contentMac: entry.contentMac,
+      size: entry.size,
+      mtime: entry.mtime,
+      updatedAt: entry.syncedAt ?? 0,
+      encoding: entry.encoding,
+      rev: entry.rev,
+    });
+  }
+  return remote;
+}
+
+function applyChange(remote: Map<string, RemoteFile>, change: ChangeEntry): void {
+  if (change.op === "delete") {
+    remote.delete(change.fileId);
+    return;
+  }
+  remote.set(change.fileId, {
+    fileId: change.fileId,
+    contentMac: change.contentMac,
+    size: change.size,
+    mtime: change.mtime,
+    updatedAt: change.updatedAt,
+    encoding: change.encoding,
+    rev: remoteRev(change),
+  });
+}
+
+function remoteSide(file: RemoteFile | null): { contentMac: string; encoding: Encoding; rev: number } | null {
+  if (!file) return null;
+  return { contentMac: file.contentMac, encoding: file.encoding, rev: remoteRev(file) };
+}
+
+function baseOf(entry: FileIndexEntry | undefined): { rev?: number; contentMac: string } | null {
+  if (!entry) return null;
+  return { rev: entry.rev, contentMac: entry.contentMac };
+}
+
+function syncedEntry(
+  path: string,
+  mtime: number,
+  size: number,
+  contentMac: string,
+  encoding: Encoding,
+  rev: number | undefined,
+  syncedAt = Date.now(),
+): FileIndexEntry {
+  const entry: FileIndexEntry = { path, mtime, size, contentMac, encoding, syncedAt };
+  if (typeof rev === "number" && rev > 0) entry.rev = rev;
+  return entry;
+}
+
+async function fingerprint(ready: ReadyClient, plain: Uint8Array): Promise<string> {
+  return ready.keys ? contentMac(ready.keys.idKey, plain) : plainMac(plain);
+}
+
+async function putFile(
+  ready: ReadyClient,
+  fileId: string,
+  path: string,
+  plain: Uint8Array,
+  mac: string,
+  encoding: Encoding,
+  mtime: number,
+  parentRev: number | null,
+): Promise<PutResult> {
+  return ready.client.putObject(fileId, {
+    vault: ready.vaultName,
+    vaultId: ready.vaultId,
+    pathCipher: ready.keys
+      ? await sealBytes(ready.keys.encKey, new TextEncoder().encode(path), `path:${fileId}`, true)
+      : { v: 0, raw: bytesToBase64(new TextEncoder().encode(path)) },
+    contentCipher: ready.keys
+      ? await sealBytes(ready.keys.encKey, plain, `body:${fileId}`, true)
+      : { v: 0, raw: bytesToBase64(plain) },
+    contentMac: mac,
+    size: plain.byteLength,
+    mtime,
+    encoding,
+    parentRev,
+  });
+}
+
+async function uploadTracked(
+  plugin: E2eeSyncPlugin,
+  ready: ReadyClient,
+  index: Record<string, FileIndexEntry>,
+  input: {
+    fileId: string;
+    path: string;
+    plain: Uint8Array;
+    mac: string;
+    encoding: Encoding;
+    mtime: number;
+    size: number;
+    parentRev: number | null;
+    base: FileIndexEntry | null;
+    remote: RemoteFile | null;
+  },
+): Promise<"uploaded" | PendingConflict> {
+  try {
+    const result = await putFile(ready, input.fileId, input.path, input.plain, input.mac, input.encoding, input.mtime, input.parentRev);
+    index[input.fileId] = syncedEntry(input.path, input.mtime, input.size, input.mac, input.encoding, result.rev || input.remote?.rev);
+    return "uploaded";
+  } catch (error) {
+    if (!(error instanceof SyncConflictError)) throw error;
+    return pendingFromError(ready, input.fileId, input.path, input.plain, input.base, input.encoding, error, 0);
+  }
+}
+
+async function pendingConflict(
+  ready: ReadyClient,
+  input: {
+    fileId: string;
+    path: string;
+    kind: PendingConflict["kind"];
+    localBytes: Uint8Array | null;
+    remote: RemoteFile | null;
+    base: FileIndexEntry | null;
+    encoding: Encoding;
+  },
+): Promise<PendingConflict> {
+  let remoteBytes: Uint8Array | null = null;
+  let kind = input.kind;
+  if (input.remote && kind !== "remote-deleted") {
+    try {
+      remoteBytes = await downloadPlain(ready, input.fileId);
+    } catch (error) {
+      if (!isMissingFile(error)) throw error;
+      kind = "remote-deleted";
+    }
+  }
+  return {
+    fileId: input.fileId,
+    path: input.path,
+    kind,
+    localBytes: input.localBytes,
+    remoteBytes,
+    remote: kind === "remote-deleted" ? null : input.remote,
+    baseRev: input.base?.rev && input.base.rev > 0 ? input.base.rev : null,
+    baseMac: input.base?.contentMac ?? null,
+    encoding: input.encoding,
+  };
+}
+
+async function pendingFromError(
+  ready: ReadyClient,
+  fileId: string,
+  path: string,
+  localBytes: Uint8Array | null,
+  base: FileIndexEntry | null,
+  encoding: Encoding,
+  error: SyncConflictError,
+  attempt: number,
+): Promise<PendingConflict> {
+  if (!error.file) {
+    return {
+      fileId,
+      path,
+      kind: "remote-deleted",
+      localBytes,
+      remoteBytes: null,
+      remote: null,
+      baseRev: base?.rev && base.rev > 0 ? base.rev : null,
+      baseMac: base?.contentMac ?? null,
+      encoding,
+      attempt,
+    };
+  }
+  let remoteBytes: Uint8Array | null = null;
+  try {
+    remoteBytes = await downloadPlain(ready, fileId);
+  } catch (readError) {
+    if (!isMissingFile(readError)) throw readError;
+    return pendingFromError(ready, fileId, path, localBytes, base, encoding, new SyncConflictError("deleted", null), attempt);
+  }
+  return {
+    fileId,
+    path,
+    kind: "content",
+    localBytes,
+    remoteBytes,
+    remote: error.file,
+    baseRev: base?.rev && base.rev > 0 ? base.rev : null,
+    baseMac: base?.contentMac ?? null,
+    encoding,
+    attempt,
+  };
+}
+
+async function downloadPlain(ready: ReadyClient, fileId: string): Promise<Uint8Array> {
+  const stored = await ready.client.getObject(fileId);
+  return openBytes(ready.keys?.encKey ?? null, stored.contentCipher, `body:${fileId}`);
+}
+
+function isMissingFile(error: unknown): boolean {
+  return error instanceof Error && /not on the server/i.test(error.message);
+}
+
+function conflictView(item: PendingConflict, index: number, total: number): ConflictView {
+  const markdown = item.path.toLowerCase().endsWith(".md");
+  return {
+    index,
+    total,
+    path: item.path,
+    kind: item.kind,
+    localText: markdown ? decodeUtf8(item.localBytes) : null,
+    remoteText: markdown ? decodeUtf8(item.remoteBytes) : null,
+    baseRev: item.baseRev,
+    baseMac: item.baseMac,
+    remoteRev: item.remote ? remoteRev(item.remote) || null : null,
+    remoteMac: item.remote?.contentMac ?? null,
+  };
+}
+
+function decodeUtf8(bytes: Uint8Array | null): string | null {
+  if (!bytes) return null;
+  if (bytes.byteLength === 0) return "";
+  try {
+    const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    if (text.includes("\u0000")) return null;
+    return text;
+  } catch {
+    return null;
+  }
+}
+
+async function applyConflict(
+  plugin: E2eeSyncPlugin,
+  ready: ReadyClient,
+  index: Record<string, FileIndexEntry>,
+  item: PendingConflict,
+  choice: ConflictChoice,
+  device: string,
+  encoding: Encoding,
+): Promise<"resolved" | "unresolved" | PendingConflict> {
+  if (choice.action === "skip") return "unresolved";
+  if (item.kind === "remote-deleted") {
+    if (choice.action === "remote") {
+      await deleteVaultPath(plugin, item.path);
+      delete index[item.fileId];
+      return "resolved";
+    }
+    if (choice.action === "local") return uploadCurrent(plugin, ready, index, item, null, encoding);
+    return "unresolved";
+  }
+  if (item.kind === "local-deleted") {
+    if (choice.action === "local") {
+      await ready.client.deleteObjects(ready.vaultName, [item.fileId], plugin.app.vault.getFiles().length);
+      delete index[item.fileId];
+      return "resolved";
+    }
+    if (choice.action === "remote" && item.remote && item.remoteBytes) {
+      await writeVaultFile(plugin.app.vault, item.path, item.remoteBytes);
+      stampMtime(plugin, item.path, item.remote.mtime);
+      const stat = fileStat(plugin, item.path, item.remote.mtime, item.remoteBytes.byteLength);
+      index[item.fileId] = syncedEntry(item.path, stat.mtime, stat.size, item.remote.contentMac, item.remote.encoding, remoteRev(item.remote));
+      return "resolved";
+    }
+    return "unresolved";
+  }
+  if (choice.action === "remote" && item.remote && item.remoteBytes) {
+    await writeVaultFile(plugin.app.vault, item.path, item.remoteBytes);
+    stampMtime(plugin, item.path, item.remote.mtime);
+    const stat = fileStat(plugin, item.path, item.remote.mtime, item.remoteBytes.byteLength);
+    index[item.fileId] = syncedEntry(item.path, stat.mtime, stat.size, item.remote.contentMac, item.remote.encoding, remoteRev(item.remote));
+    return "resolved";
+  }
+  if (choice.action === "local") {
+    const parent = item.remote && remoteRev(item.remote) > 0 ? remoteRev(item.remote) : null;
+    return uploadCurrent(plugin, ready, index, item, parent, encoding);
+  }
+  if (choice.action === "both" && item.remoteBytes) {
+    const copyPath = conflictCopyPath(plugin.app.vault, item.path, device, new Date());
+    await writeVaultFile(plugin.app.vault, copyPath, item.remoteBytes);
+    new Notice(t("conflictCopy", { path: copyPath }));
+    const parent = item.remote && remoteRev(item.remote) > 0 ? remoteRev(item.remote) : null;
+    const localOutcome = await uploadCurrent(plugin, ready, index, item, parent, encoding);
+    if (localOutcome !== "resolved") return localOutcome;
+    try {
+      await uploadFreshPath(plugin, ready, index, copyPath, item.remoteBytes, item.remote?.encoding ?? encoding, null);
+    } catch (error) {
+      if (!(error instanceof SyncConflictError)) throw error;
+    }
+    return "resolved";
+  }
+  if (choice.action === "merge") {
+    const bytes = new TextEncoder().encode(choice.text);
+    if (bytes.byteLength > MAX_FILE_BYTES) return "unresolved";
+    await writeVaultFile(plugin.app.vault, item.path, bytes);
+    const mac = await fingerprint(ready, bytes);
+    const stat = fileStat(plugin, item.path, Date.now(), bytes.byteLength);
+    const parent = item.remote && remoteRev(item.remote) > 0 ? remoteRev(item.remote) : null;
+    try {
+      const result = await putFile(ready, item.fileId, item.path, bytes, mac, encoding, stat.mtime, parent);
+      index[item.fileId] = syncedEntry(item.path, stat.mtime, stat.size, mac, encoding, result.rev);
+      return "resolved";
+    } catch (error) {
+      if (!(error instanceof SyncConflictError)) throw error;
+      return pendingFromError(ready, item.fileId, item.path, bytes, index[item.fileId] ?? null, encoding, error, (item.attempt ?? 0) + 1);
+    }
+  }
+  return "unresolved";
+}
+
+async function uploadCurrent(
+  plugin: E2eeSyncPlugin,
+  ready: ReadyClient,
+  index: Record<string, FileIndexEntry>,
+  item: PendingConflict,
+  parentRev: number | null,
+  encoding: Encoding,
+): Promise<"resolved" | PendingConflict | "unresolved"> {
+  const file = plugin.app.vault.getAbstractFileByPath(item.path);
+  if (!(file instanceof TFile)) return "unresolved";
+  const plain = new Uint8Array(await plugin.app.vault.readBinary(file));
+  if (plain.byteLength > MAX_FILE_BYTES) return "unresolved";
+  const mac = await fingerprint(ready, plain);
+  try {
+    const result = await putFile(ready, item.fileId, item.path, plain, mac, encoding, file.stat.mtime, parentRev);
+    index[item.fileId] = syncedEntry(item.path, file.stat.mtime, file.stat.size, mac, encoding, result.rev);
+    return "resolved";
+  } catch (error) {
+    if (!(error instanceof SyncConflictError)) throw error;
+    return pendingFromError(ready, item.fileId, item.path, plain, index[item.fileId] ?? null, encoding, error, (item.attempt ?? 0) + 1);
+  }
+}
+
+async function uploadFreshPath(
+  plugin: E2eeSyncPlugin,
+  ready: ReadyClient,
+  index: Record<string, FileIndexEntry>,
+  path: string,
+  plain: Uint8Array,
+  encoding: Encoding,
+  parentRev: number | null,
+): Promise<void> {
+  const fileId = ready.keys
+    ? await fileIdForPath(ready.keys.idKey, path, ready.vaultName)
+    : await plainFileId(ready.vaultName, path);
+  const mac = await fingerprint(ready, plain);
+  const stat = fileStat(plugin, path, Date.now(), plain.byteLength);
+  const result = await putFile(ready, fileId, path, plain, mac, encoding, stat.mtime, parentRev);
+  index[fileId] = syncedEntry(path, stat.mtime, stat.size, mac, encoding, result.rev);
+}
+
+async function deleteVaultPath(plugin: E2eeSyncPlugin, path: string): Promise<void> {
+  const file = plugin.app.vault.getAbstractFileByPath(path);
+  if (file instanceof TFile) await plugin.app.vault.delete(file);
+}
+
+function fileStat(plugin: E2eeSyncPlugin, path: string, fallbackMtime: number, fallbackSize: number): { mtime: number; size: number } {
+  const file = plugin.app.vault.getAbstractFileByPath(path);
+  if (file instanceof TFile) return { mtime: file.stat.mtime, size: file.stat.size };
+  return { mtime: fallbackMtime, size: fallbackSize };
+}
+
+function deviceLabel(): string {
+  let name = "device";
+  try {
+    const os = require("os") as { hostname?: () => string };
+    const host = os.hostname?.()?.trim();
+    if (host) name = host;
+  } catch {
+    name = "device";
+  }
+  const cleaned = name.replace(/[\\/:*?"<>|]/g, "-").replace(/\s+/g, " ").trim();
+  return (cleaned || "device").slice(0, 40);
+}
+
+function conflictCopyPath(vault: Vault, path: string, device: string, when: Date): string {
+  const slash = path.lastIndexOf("/");
+  const dir = slash >= 0 ? path.slice(0, slash + 1) : "";
+  const base = slash >= 0 ? path.slice(slash + 1) : path;
+  const dot = base.lastIndexOf(".");
+  const stem = dot > 0 ? base.slice(0, dot) : base;
+  const ext = dot > 0 ? base.slice(dot) : "";
+  const pad = (part: number) => String(part).padStart(2, "0");
+  const stamp = `${when.getFullYear()}${pad(when.getMonth() + 1)}${pad(when.getDate())}${pad(when.getHours())}${pad(when.getMinutes())}`;
+  const label = `Conflicted copy ${device} ${stamp}`;
+  let candidate = `${dir}${stem} (${label})${ext}`;
+  let n = 2;
+  while (vault.getAbstractFileByPath(candidate)) {
+    candidate = `${dir}${stem} (${label} ${n})${ext}`;
+    n++;
+  }
+  return candidate;
 }
 
 async function pullRemote(
@@ -190,6 +738,7 @@ async function pullRemote(
   const data = await openBytes(ready.keys?.encKey ?? null, stored.contentCipher, `body:${remoteFile.fileId}`);
   await writeVaultFile(plugin.app.vault, path, data);
   stampMtime(plugin, path, remoteFile.mtime);
+  const rev = remoteRev(remoteFile);
   index[remoteFile.fileId] = {
     path,
     mtime: remoteFile.mtime,
@@ -197,6 +746,7 @@ async function pullRemote(
     contentMac: remoteFile.contentMac,
     encoding: remoteFile.encoding,
     syncedAt: Date.now(),
+    ...(rev > 0 ? { rev } : {}),
   };
   return true;
 }
@@ -226,7 +776,7 @@ export async function restoreVault(
   if (needsKey && plugin.settings.secretKey.trim().length < MIN_SECRET_LENGTH) throw new Error(t("needSecret"));
   const keys = needsKey ? await deriveKeys(requireSecret(plugin.settings.secretKey)) : null;
   const destination = mode === "create" ? prepareRestoreFolder(plugin, folder) : "";
-  const written: Array<{ path: string; fileId: string; contentMac: string; encoding: Encoding }> = [];
+  const written: Array<{ path: string; fileId: string; contentMac: string; encoding: Encoding; rev: number }> = [];
   let restored = 0;
   for (const file of manifest.files) {
     const stored = await client.getObject(file.fileId);
@@ -236,7 +786,7 @@ export async function restoreVault(
     const data = await openBytes(keys?.encKey ?? null, stored.contentCipher, `body:${file.fileId}`);
     if (mode === "create") writeOutside(destination, path, data);
     else await writeVaultFile(plugin.app.vault, path, data);
-    written.push({ path, fileId: file.fileId, contentMac: file.contentMac, encoding: file.encoding });
+    written.push({ path, fileId: file.fileId, contentMac: file.contentMac, encoding: file.encoding, rev: remoteRev(file) });
     restored++;
     plugin.setStatus(t("restoreProgress", { done: restored, total: manifest.files.length }));
   }
@@ -254,9 +804,16 @@ export async function restoreVault(
         contentMac: item.contentMac,
         encoding: item.encoding,
         syncedAt,
+        ...(item.rev > 0 ? { rev: item.rev } : {}),
       };
     }
     plugin.settings.index = index;
+    const revisionsKnown = manifest.files.every((file) => remoteRev(file) > 0);
+    if (typeof manifest.cursor === "number" && (manifest.files.length === 0 || revisionsKnown)) {
+      plugin.settings.changeCursor = manifest.cursor;
+    } else {
+      plugin.settings.changeCursor = null;
+    }
   }
   if (mode === "create") {
     installPluginCopy(plugin, destination);

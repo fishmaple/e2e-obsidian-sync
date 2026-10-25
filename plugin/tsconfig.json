@@ -13,6 +13,8 @@
     "src/**/*.ts",
     "../shared/src/codec.ts",
     "../shared/src/crypto.ts",
-    "../shared/src/protocol.ts"
+    "../shared/src/merge.ts",
+    "../shared/src/protocol.ts",
+    "../shared/src/reconcile.ts"
   ]
 }

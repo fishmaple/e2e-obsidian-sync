@@ -11,9 +11,10 @@ import {
   type Encoding,
   type ObjectPayload,
   type PayloadCipher,
+  type RemoteFile,
 } from "../../shared/src/protocol";
 import type { AppConfig } from "./config";
-import type { SyncDb } from "./db";
+import type { ObjectRow, SyncDb } from "./db";
 import { accessPage, accountPage, homePage, installPage, installPs1, installSh, loginPage, messagePage, obsidianReturnPage } from "./html";
 import { createBlobStore } from "./storage";
 import { completeOidcLogin, createOidcRequest } from "./oidc";
@@ -334,15 +335,19 @@ export function createApp(deps: AppDeps): Hono {
     const byId = await db.findVaultById(accountId, key);
     const name = byId?.name ?? (VAULT_NAME.test(key) ? key : "");
     if (!name) throw new HttpError(404, "The remote vault does not exist");
-    const files = (await db.listObjects(accountId, name)).map((file) => ({
-      fileId: file.fileId,
-      contentMac: file.contentMac,
-      size: file.size,
-      mtime: file.mtime,
-      updatedAt: file.updatedAt,
-      encoding: file.encoding,
-    }));
-    return c.json({ files });
+    const files = (await db.listObjects(accountId, name)).map(toRemoteFile);
+    const cursor = await db.vaultCursor(accountId, name);
+    return c.json({ files, cursor });
+  });
+
+  // `since` omitted or empty reads the change log from the beginning. It is not a snapshot of files that predate the log.
+  api.get("/changes", async (c) => {
+    const { accountId } = await requireToken(c);
+    const name = await vaultNameFromQuery(accountId, c.req.query("vault"));
+    const since = parseSince(c.req.query("since"));
+    const limit = parseLimit(c.req.query("limit"));
+    const page = await db.listChanges(accountId, name, since, limit);
+    return c.json({ since, cursor: page.cursor, more: page.more, changes: page.changes });
   });
 
   api.put("/objects/:fileId", async (c) => {
@@ -357,8 +362,7 @@ export function createApp(deps: AppDeps): Hono {
     if (payload.encoding !== "e2ee" && await db.vaultEncrypted(accountId, vaultName)) {
       throw new HttpError(409, "This vault is encrypted and no longer accepts plaintext");
     }
-    await blobs.put(accountId, fileId, JSON.stringify(payload.contentCipher));
-    await db.upsertObject({
+    const result = await db.putObjectRevision({
       accountId,
       fileId,
       vaultName,
@@ -366,11 +370,30 @@ export function createApp(deps: AppDeps): Hono {
       contentMac: payload.contentMac,
       size: payload.size,
       mtime: payload.mtime,
-      updatedAt: Date.now(),
       encoding: payload.encoding,
+    }, payload.parentRev ?? null, async () => {
+      await blobs.put(accountId, fileId, JSON.stringify(payload.contentCipher));
     });
+    if (result.status === "conflict") {
+      const deleted = result.reason === "deleted";
+      return c.json({
+        error: deleted
+          ? "The remote copy was deleted since this device last synced"
+          : "The remote copy changed since this device last synced",
+        reason: result.reason,
+        file: result.current ? toRemoteFile(result.current) : null,
+      }, 409);
+    }
     await db.rememberVault(accountId, vaultName, payload.encoding === "e2ee");
-    return c.json({ ok: true });
+    return c.json({
+      ok: true,
+      rev: result.row.rev,
+      contentMac: result.row.contentMac,
+      mtime: result.row.mtime,
+      encoding: result.row.encoding,
+      size: result.row.size,
+      updatedAt: result.row.updatedAt,
+    });
   });
 
   api.get("/objects/:fileId", async (c) => {
@@ -388,6 +411,7 @@ export function createApp(deps: AppDeps): Hono {
       size: row.size,
       mtime: row.mtime,
       encoding: row.encoding,
+      rev: row.rev,
     });
   });
 
@@ -472,6 +496,14 @@ export function createApp(deps: AppDeps): Hono {
     const accountId = await db.findAccountByToken(match[1] ?? "");
     if (!accountId) throw new HttpError(401, "The login expired. Log in again.");
     return { accountId };
+  }
+
+  async function vaultNameFromQuery(accountId: string, vault: string | undefined): Promise<string> {
+    const key = (vault ?? "").trim();
+    const byId = await db.findVaultById(accountId, key);
+    const name = byId?.name ?? (VAULT_NAME.test(key) ? key : "");
+    if (!name) throw new HttpError(404, "The remote vault does not exist");
+    return name;
   }
 }
 
@@ -628,6 +660,34 @@ function parseJson(body: Uint8Array): unknown {
   }
 }
 
+function toRemoteFile(row: ObjectRow): RemoteFile {
+  return {
+    fileId: row.fileId,
+    contentMac: row.contentMac,
+    size: row.size,
+    mtime: row.mtime,
+    updatedAt: row.updatedAt,
+    encoding: row.encoding,
+    rev: row.rev,
+  };
+}
+
+function parseSince(value: string | undefined): number {
+  if (value === undefined || value === "") return 0;
+  if (!/^\d+$/.test(value)) throw new HttpError(400, "Invalid changes cursor");
+  const since = Number(value);
+  if (!Number.isSafeInteger(since)) throw new HttpError(400, "Invalid changes cursor");
+  return since;
+}
+
+function parseLimit(value: string | undefined): number {
+  if (value === undefined || value === "") return 2000;
+  if (!/^\d+$/.test(value)) throw new HttpError(400, "Invalid changes limit");
+  const limit = Number(value);
+  if (!Number.isSafeInteger(limit) || limit < 1) throw new HttpError(400, "Invalid changes limit");
+  return Math.min(5000, limit);
+}
+
 function parseVaultName(value: string | undefined): string {
   const name = (value ?? "").trim();
   if (!VAULT_NAME.test(name)) throw new HttpError(400, "Invalid vault name");
@@ -678,7 +738,32 @@ function parseObjectPayload(value: unknown, requireEncryption: boolean): ObjectP
     size: body.size,
     mtime: body.mtime,
     encoding,
+    parentRev: parseParentRev(value),
   };
+}
+
+// Missing parentRev on an existing object is a conflict when the content fingerprint differs.
+// The same fingerprint is an idempotent success and does not bump rev. Old clients can create
+// files and retry identical uploads; they cannot silently overwrite a divergent copy.
+function parseParentRev(value: unknown): number | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as { parentRev?: unknown; parent_rev?: unknown };
+  const camel = record.parentRev;
+  const snake = record.parent_rev;
+  if (camel !== undefined && snake !== undefined && !sameParent(camel, snake)) {
+    throw new HttpError(400, "parentRev and parent_rev do not match");
+  }
+  const raw = camel !== undefined ? camel : snake;
+  if (raw === undefined || raw === null) return null;
+  if (typeof raw !== "number" || !Number.isSafeInteger(raw) || raw < 0) {
+    throw new HttpError(400, "Invalid parent revision");
+  }
+  return raw;
+}
+
+function sameParent(left: unknown, right: unknown): boolean {
+  if (left === null && right === null) return true;
+  return left === right;
 }
 
 function cipherEncoding(value: PayloadCipher): Encoding {

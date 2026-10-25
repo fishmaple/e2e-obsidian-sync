@@ -35,10 +35,17 @@ export interface RemoteFile {
   mtime: number;
   updatedAt: number;
   encoding: Encoding;
+  /**
+   * Monotonic per-file revision. Missing or 0 means the server did not report one
+   * (older servers). New servers start at 1.
+   */
+  rev?: number;
 }
 
 export interface Manifest {
   files: RemoteFile[];
+  /** Vault change-log head. Older servers omit this. */
+  cursor?: number;
 }
 
 export interface ObjectPayload {
@@ -50,6 +57,55 @@ export interface ObjectPayload {
   size: number;
   mtime: number;
   encoding: Encoding;
+  /**
+   * Revision this device last synced for the file.
+   * Null or omitted means first upload / unknown.
+   * JSON may use `parentRev` (canonical, same style as contentMac) or `parent_rev`.
+   */
+  parentRev?: number | null;
+}
+
+export interface PutResult {
+  ok: true;
+  rev: number;
+  contentMac: string;
+  mtime: number;
+  encoding: Encoding;
+  size: number;
+  updatedAt: number;
+}
+
+export type ChangeOp = "upsert" | "delete";
+
+export interface ChangeEntry {
+  seq: number;
+  op: ChangeOp;
+  fileId: string;
+  rev: number;
+  contentMac: string;
+  size: number;
+  mtime: number;
+  updatedAt: number;
+  encoding: Encoding;
+}
+
+export interface ChangesResponse {
+  since: number;
+  cursor: number;
+  more: boolean;
+  changes: ChangeEntry[];
+}
+
+export interface ConflictBody {
+  error: string;
+  reason: "parent_rev" | "deleted";
+  file: RemoteFile | null;
+}
+
+/** Positive integer revision, or 0 when the server did not send one. */
+export function remoteRev(file: { rev?: unknown }): number {
+  const rev = file.rev;
+  return typeof rev === "number" && Number.isSafeInteger(rev) && rev > 0 ? rev : 0;
 }
 
 export interface VaultStat {

@@ -18,6 +18,8 @@ export interface FileIndexEntry {
   contentMac: string;
   encoding?: "e2ee" | "plain";
   syncedAt?: number;
+  /** Last revision successfully synced with the server. */
+  rev?: number;
 }
 
 export interface VaultBinding {
@@ -46,6 +48,8 @@ export interface SyncSettings {
   lastSyncAt: number | null;
   lastSyncSummary: string;
   gitignorePrompted: boolean;
+  /** Change-log cursor for the bound vault. Null until a full snapshot has been applied. */
+  changeCursor: number | null;
   index: Record<string, FileIndexEntry>;
 }
 
@@ -69,6 +73,7 @@ const DEFAULT_SETTINGS: SyncSettings = {
   lastSyncAt: null,
   lastSyncSummary: "",
   gitignorePrompted: false,
+  changeCursor: null,
   index: {},
 };
 
@@ -184,6 +189,10 @@ export default class E2eeSyncPlugin extends Plugin {
       : allSuffixes();
     if (typeof rest.syncOther !== "boolean") this.settings.syncOther = true;
     this.settings.index ??= {};
+    const storedCursor = rest.changeCursor;
+    this.settings.changeCursor = typeof storedCursor === "number" && Number.isSafeInteger(storedCursor) && storedCursor >= 0
+      ? storedCursor
+      : null;
     this.settings.boundVaultId = typeof rest.boundVaultId === "string" ? rest.boundVaultId : "";
     this.settings.vaultBindings = normalizeBindings(rest.vaultBindings);
     const shared = readSharedConfig();
@@ -243,6 +252,7 @@ export default class E2eeSyncPlugin extends Plugin {
     const next = value.trim();
     if (next !== this.settings.accountId) {
       this.settings.index = {};
+      this.settings.changeCursor = null;
       this.settings.apiToken = "";
     }
     this.settings.accountId = next;
@@ -257,7 +267,10 @@ export default class E2eeSyncPlugin extends Plugin {
     this.settings.displayName = displayName || (accountId === previous ? this.settings.displayName : "");
     const saved = this.settings.vaultBindings[accountId];
     if (saved?.vaultId) {
-      if (saved.vaultId !== this.settings.boundVaultId) this.settings.index = {};
+      if (saved.vaultId !== this.settings.boundVaultId) {
+        this.settings.index = {};
+        this.settings.changeCursor = null;
+      }
       this.settings.boundVaultId = saved.vaultId;
       this.settings.boundVault = saved.vaultName;
       this.settings.boundAccountId = accountId;
@@ -265,7 +278,10 @@ export default class E2eeSyncPlugin extends Plugin {
     } else if (this.settings.boundAccountId === accountId && (this.settings.boundVaultId || this.settings.boundVault)) {
       this.rememberBinding(accountId);
     } else {
-      if (this.settings.boundVaultId || this.settings.boundVault) this.settings.index = {};
+      if (this.settings.boundVaultId || this.settings.boundVault) {
+        this.settings.index = {};
+        this.settings.changeCursor = null;
+      }
       this.clearBinding();
     }
     this.refreshRibbon();
@@ -292,7 +308,10 @@ export default class E2eeSyncPlugin extends Plugin {
   async alignEncryptionWithRemote(): Promise<boolean> {
     const encrypted = await this.remoteEncrypted();
     if (this.settings.encryptNotes === encrypted) return false;
-    if (encrypted) this.settings.index = {};
+    if (encrypted) {
+      this.settings.index = {};
+      this.settings.changeCursor = null;
+    }
     this.settings.encryptNotes = encrypted;
     await this.saveSettings();
     return true;
@@ -323,7 +342,10 @@ export default class E2eeSyncPlugin extends Plugin {
 
   async bindVault(name: string, encrypted: boolean, vaultId: string): Promise<void> {
     const switched = this.settings.boundVaultId !== vaultId || this.settings.boundAccountId !== this.settings.accountId;
-    if (switched || this.settings.encryptNotes !== encrypted) this.settings.index = {};
+    if (switched || this.settings.encryptNotes !== encrypted) {
+      this.settings.index = {};
+      this.settings.changeCursor = null;
+    }
     this.settings.boundVault = name;
     this.settings.boundVaultId = vaultId;
     this.settings.boundAccountId = this.settings.accountId;
@@ -334,7 +356,10 @@ export default class E2eeSyncPlugin extends Plugin {
   }
 
   setSecret(value: string): void {
-    if (value !== this.settings.secretKey) this.settings.index = {};
+    if (value !== this.settings.secretKey) {
+      this.settings.index = {};
+      this.settings.changeCursor = null;
+    }
     this.settings.secretKey = value;
   }
 

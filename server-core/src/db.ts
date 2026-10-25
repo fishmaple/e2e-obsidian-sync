@@ -22,7 +22,24 @@ export interface ObjectRow {
   mtime: number;
   updatedAt: number;
   encoding: Encoding;
+  rev: number;
 }
+
+export interface ChangeRow {
+  seq: number;
+  op: "upsert" | "delete";
+  fileId: string;
+  rev: number;
+  contentMac: string;
+  size: number;
+  mtime: number;
+  updatedAt: number;
+  encoding: Encoding;
+}
+
+export type PutRevisionResult =
+  | { status: "created" | "updated" | "unchanged"; row: ObjectRow }
+  | { status: "conflict"; reason: "parent_rev" | "deleted"; current: ObjectRow | null };
 
 export interface VaultStatRow {
   id: string;
@@ -57,7 +74,22 @@ interface ObjectSqlRow {
   mtime: number | string;
   updated_at: number | string;
   encoding: string | null;
+  rev: number | string | null;
 }
+
+interface ChangeSqlRow {
+  seq: number | string;
+  op: string;
+  file_id: string;
+  rev: number | string | null;
+  content_mac: string | null;
+  size: number | string | null;
+  mtime: number | string | null;
+  updated_at: number | string;
+  encoding: string | null;
+}
+
+const OBJECT_COLUMNS = "account_id, file_id, vault_name, path_cipher, content_mac, size, mtime, updated_at, encoding, rev";
 
 export class SyncDb {
   constructor(private readonly sql: Queryable) {}
@@ -220,7 +252,7 @@ export class SyncDb {
 
   async listObjects(accountId: string, vaultName: string): Promise<ObjectRow[]> {
     const rows = await this.sql.all<ObjectSqlRow>(`
-      SELECT account_id, file_id, vault_name, path_cipher, content_mac, size, mtime, updated_at, encoding
+      SELECT ${OBJECT_COLUMNS}
       FROM objects WHERE account_id = ? AND vault_name = ? ORDER BY file_id
     `, [accountId, vaultName]);
     return rows.map(mapObject);
@@ -228,10 +260,37 @@ export class SyncDb {
 
   async findObject(accountId: string, fileId: string): Promise<ObjectRow | undefined> {
     const row = await this.sql.get<ObjectSqlRow>(`
-      SELECT account_id, file_id, vault_name, path_cipher, content_mac, size, mtime, updated_at, encoding
+      SELECT ${OBJECT_COLUMNS}
       FROM objects WHERE account_id = ? AND file_id = ?
     `, [accountId, fileId]);
     return row ? mapObject(row) : undefined;
+  }
+
+  async vaultCursor(accountId: string, vaultName: string): Promise<number> {
+    const row = await this.sql.get<{ seq: number | string }>(
+      "SELECT seq FROM vault_cursors WHERE account_id = ? AND vault_name = ?",
+      [accountId, vaultName],
+    );
+    return Number(row?.seq ?? 0);
+  }
+
+  async listChanges(accountId: string, vaultName: string, since: number, limit: number): Promise<{
+    changes: ChangeRow[];
+    cursor: number;
+    more: boolean;
+  }> {
+    const head = await this.vaultCursor(accountId, vaultName);
+    const rows = await this.sql.all<ChangeSqlRow>(`
+      SELECT seq, op, file_id, rev, content_mac, size, mtime, updated_at, encoding
+      FROM changes
+      WHERE account_id = ? AND vault_name = ? AND seq > ?
+      ORDER BY seq
+      LIMIT ?
+    `, [accountId, vaultName, since, limit + 1]);
+    const more = rows.length > limit;
+    const page = more ? rows.slice(0, limit) : rows;
+    const cursor = more ? Number(page[page.length - 1]?.seq ?? since) : head;
+    return { changes: page.map(mapChange), cursor, more };
   }
 
   async listVaultStats(accountId: string): Promise<VaultStatRow[]> {
@@ -361,20 +420,80 @@ export class SyncDb {
     }));
   }
 
-  async upsertObject(row: ObjectRow): Promise<void> {
-    const existing = await this.findObject(row.accountId, row.fileId);
-    if (existing) {
-      await this.sql.run(`
+  async putObjectRevision(
+    row: Omit<ObjectRow, "rev" | "updatedAt">,
+    parentRev: number | null,
+    writeBlob: () => Promise<void>,
+  ): Promise<PutRevisionResult> {
+    await this.sql.exec("BEGIN");
+    try {
+      const existing = await this.findObject(row.accountId, row.fileId);
+      if (existing && existing.contentMac === row.contentMac && existing.encoding === row.encoding) {
+        await this.sql.exec("COMMIT");
+        return { status: "unchanged", row: existing };
+      }
+      if (!existing) {
+        if (parentRev !== null) {
+          await this.sql.exec("COMMIT");
+          return { status: "conflict", reason: "deleted", current: null };
+        }
+        const created: ObjectRow = { ...row, rev: 1, updatedAt: Date.now() };
+        await this.insertObject(created);
+        await this.appendChange(created, "upsert");
+        await writeBlob();
+        await this.sql.exec("COMMIT");
+        return { status: "created", row: created };
+      }
+      if (parentRev === null || parentRev !== existing.rev) {
+        await this.sql.exec("COMMIT");
+        return { status: "conflict", reason: "parent_rev", current: existing };
+      }
+      const updated: ObjectRow = { ...row, rev: existing.rev + 1, updatedAt: Date.now() };
+      const changed = await this.sql.run(`
         UPDATE objects
-        SET vault_name = ?, path_cipher = ?, content_mac = ?, size = ?, mtime = ?, updated_at = ?, encoding = ?
-        WHERE account_id = ? AND file_id = ?
-      `, [row.vaultName, row.pathCipher, row.contentMac, row.size, row.mtime, row.updatedAt, row.encoding, row.accountId, row.fileId]);
-      return;
+        SET vault_name = ?, path_cipher = ?, content_mac = ?, size = ?, mtime = ?, updated_at = ?, encoding = ?, rev = ?
+        WHERE account_id = ? AND file_id = ? AND rev = ?
+      `, [
+        updated.vaultName,
+        updated.pathCipher,
+        updated.contentMac,
+        updated.size,
+        updated.mtime,
+        updated.updatedAt,
+        updated.encoding,
+        updated.rev,
+        updated.accountId,
+        updated.fileId,
+        parentRev,
+      ]);
+      if (changed === 0) {
+        const current = await this.findObject(row.accountId, row.fileId);
+        await this.sql.exec("COMMIT");
+        return { status: "conflict", reason: current ? "parent_rev" : "deleted", current: current ?? null };
+      }
+      await this.appendChange(updated, "upsert");
+      await writeBlob();
+      await this.sql.exec("COMMIT");
+      return { status: "updated", row: updated };
+    } catch (error) {
+      try {
+        await this.sql.exec("ROLLBACK");
+      } catch {
+        // The transaction may already be closed.
+      }
+      if (isUniqueError(error)) {
+        const current = await this.findObject(row.accountId, row.fileId);
+        if (current) return { status: "conflict", reason: "parent_rev", current };
+      }
+      throw error;
     }
+  }
+
+  private async insertObject(row: ObjectRow): Promise<void> {
     await this.sql.run(`
-      INSERT INTO objects (account_id, file_id, vault_name, path_cipher, content_mac, size, mtime, updated_at, encoding)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `, [row.accountId, row.fileId, row.vaultName, row.pathCipher, row.contentMac, row.size, row.mtime, row.updatedAt, row.encoding]);
+      INSERT INTO objects (account_id, file_id, vault_name, path_cipher, content_mac, size, mtime, updated_at, encoding, rev)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `, [row.accountId, row.fileId, row.vaultName, row.pathCipher, row.contentMac, row.size, row.mtime, row.updatedAt, row.encoding, row.rev]);
   }
 
   async deleteObjects(accountId: string, fileIds: string[], vaultName: string): Promise<string[]> {
@@ -382,11 +501,9 @@ export class SyncDb {
     await this.sql.exec("BEGIN");
     try {
       for (const fileId of fileIds) {
-        const row = await this.sql.get<{ file_id: string }>(
-          "SELECT file_id FROM objects WHERE account_id = ? AND file_id = ? AND vault_name = ?",
-          [accountId, fileId, vaultName],
-        );
-        if (!row) continue;
+        const row = await this.findObject(accountId, fileId);
+        if (!row || row.vaultName !== vaultName) continue;
+        await this.appendChange(row, "delete");
         await this.sql.run("DELETE FROM objects WHERE account_id = ? AND file_id = ?", [accountId, fileId]);
         removed.push(fileId);
       }
@@ -399,13 +516,19 @@ export class SyncDb {
   }
 
   async deleteUnnamed(accountId: string): Promise<string[]> {
-    const rows = await this.sql.all<{ file_id: string }>(
-      "SELECT file_id FROM objects WHERE account_id = ? AND vault_name = ''",
-      [accountId],
-    );
-    const removed = rows.map((row) => row.file_id);
-    for (const fileId of removed) {
-      await this.sql.run("DELETE FROM objects WHERE account_id = ? AND file_id = ?", [accountId, fileId]);
+    const rows = await this.listObjects(accountId, "");
+    const removed: string[] = [];
+    await this.sql.exec("BEGIN");
+    try {
+      for (const row of rows) {
+        await this.appendChange(row, "delete");
+        await this.sql.run("DELETE FROM objects WHERE account_id = ? AND file_id = ?", [accountId, row.fileId]);
+        removed.push(row.fileId);
+      }
+      await this.sql.exec("COMMIT");
+    } catch (error) {
+      await this.sql.exec("ROLLBACK");
+      throw error;
     }
     return removed;
   }
@@ -457,6 +580,8 @@ export class SyncDb {
     await this.sql.exec("BEGIN");
     try {
       await this.sql.run("DELETE FROM objects WHERE account_id = ? AND vault_name = ?", [accountId, vault.name]);
+      await this.sql.run("DELETE FROM changes WHERE account_id = ? AND vault_name = ?", [accountId, vault.name]);
+      await this.sql.run("DELETE FROM vault_cursors WHERE account_id = ? AND vault_name = ?", [accountId, vault.name]);
       await this.sql.run("DELETE FROM vault_policies WHERE account_id = ? AND vault_id = ?", [accountId, vaultId]);
       await this.sql.exec("COMMIT");
     } catch (error) {
@@ -468,6 +593,46 @@ export class SyncDb {
 
   async deleteBlob(accountId: string, fileId: string): Promise<void> {
     await this.sql.run("DELETE FROM blobs WHERE account_id = ? AND file_id = ?", [accountId, fileId]);
+  }
+
+  private async appendChange(row: ObjectRow, op: "upsert" | "delete"): Promise<void> {
+    const seq = await this.bumpCursor(row.accountId, row.vaultName);
+    await this.sql.run(`
+      INSERT INTO changes (
+        account_id, vault_name, seq, op, file_id, rev, content_mac, size, mtime, updated_at, encoding
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `, [
+      row.accountId,
+      row.vaultName,
+      seq,
+      op,
+      row.fileId,
+      row.rev,
+      row.contentMac,
+      row.size,
+      row.mtime,
+      row.updatedAt,
+      row.encoding,
+    ]);
+  }
+
+  private async bumpCursor(accountId: string, vaultName: string): Promise<number> {
+    if (this.sql.dialect === "mysql") {
+      await this.sql.run(`
+        INSERT INTO vault_cursors (account_id, vault_name, seq) VALUES (?, ?, 1)
+        ON DUPLICATE KEY UPDATE seq = seq + 1
+      `, [accountId, vaultName]);
+    } else {
+      await this.sql.run(`
+        INSERT INTO vault_cursors (account_id, vault_name, seq) VALUES (?, ?, 1)
+        ON CONFLICT(account_id, vault_name) DO UPDATE SET seq = vault_cursors.seq + 1
+      `, [accountId, vaultName]);
+    }
+    const row = await this.sql.get<{ seq: number | string }>(
+      "SELECT seq FROM vault_cursors WHERE account_id = ? AND vault_name = ?",
+      [accountId, vaultName],
+    );
+    return Number(row?.seq ?? 1);
   }
 }
 
@@ -495,6 +660,11 @@ export async function openDatabase(config: AppConfig): Promise<SyncDb> {
     await database.exec("ALTER TABLE vault_policies ADD COLUMN vault_id VARCHAR(64) NOT NULL DEFAULT ''");
   } catch {
     // New databases already have this column.
+  }
+  try {
+    await database.exec("ALTER TABLE objects ADD COLUMN rev BIGINT NOT NULL DEFAULT 1");
+  } catch {
+    // New databases already have this column. Existing rows keep revision 1.
   }
   const missing = await database.all<{ account_id: string; vault_name: string }>(
     "SELECT account_id, vault_name FROM vault_policies WHERE vault_id IS NULL OR vault_id = ''",
@@ -560,7 +730,28 @@ function schema(dialect: Queryable["dialect"]): string[] {
       mtime BIGINT NOT NULL,
       updated_at BIGINT NOT NULL,
       encoding VARCHAR(16) NOT NULL DEFAULT 'e2ee',
+      rev BIGINT NOT NULL DEFAULT 1,
       PRIMARY KEY (account_id, file_id)
+    )`,
+    `CREATE TABLE IF NOT EXISTS vault_cursors (
+      account_id VARCHAR(64) NOT NULL,
+      vault_name VARCHAR(200) NOT NULL,
+      seq BIGINT NOT NULL,
+      PRIMARY KEY (account_id, vault_name)
+    )`,
+    `CREATE TABLE IF NOT EXISTS changes (
+      account_id VARCHAR(64) NOT NULL,
+      vault_name VARCHAR(200) NOT NULL,
+      seq BIGINT NOT NULL,
+      op VARCHAR(16) NOT NULL,
+      file_id VARCHAR(64) NOT NULL,
+      rev BIGINT NOT NULL DEFAULT 0,
+      content_mac VARCHAR(64) NOT NULL DEFAULT '',
+      size BIGINT NOT NULL DEFAULT 0,
+      mtime BIGINT NOT NULL DEFAULT 0,
+      updated_at BIGINT NOT NULL,
+      encoding VARCHAR(16) NOT NULL DEFAULT 'e2ee',
+      PRIMARY KEY (account_id, vault_name, seq)
     )`,
     `CREATE TABLE IF NOT EXISTS blobs (
       account_id VARCHAR(64) NOT NULL,
@@ -593,6 +784,7 @@ function hashToken(token: string): string {
 }
 
 function mapObject(row: ObjectSqlRow): ObjectRow {
+  const rev = Number(row.rev ?? 1);
   return {
     accountId: row.account_id,
     fileId: row.file_id,
@@ -603,5 +795,28 @@ function mapObject(row: ObjectSqlRow): ObjectRow {
     mtime: Number(row.mtime),
     updatedAt: Number(row.updated_at),
     encoding: row.encoding === "plain" ? "plain" : "e2ee",
+    rev: Number.isSafeInteger(rev) && rev > 0 ? rev : 1,
   };
+}
+
+function mapChange(row: ChangeSqlRow): ChangeRow {
+  const rev = Number(row.rev ?? 0);
+  return {
+    seq: Number(row.seq),
+    op: row.op === "delete" ? "delete" : "upsert",
+    fileId: row.file_id,
+    rev: Number.isSafeInteger(rev) && rev > 0 ? rev : 0,
+    contentMac: row.content_mac ?? "",
+    size: Number(row.size ?? 0),
+    mtime: Number(row.mtime ?? 0),
+    updatedAt: Number(row.updated_at),
+    encoding: row.encoding === "plain" ? "plain" : "e2ee",
+  };
+}
+
+function isUniqueError(error: unknown): boolean {
+  const code = typeof error === "object" && error && "code" in error ? String((error as { code: unknown }).code) : "";
+  if (code === "23505" || code === "1062" || code === "ER_DUP_ENTRY") return true;
+  const message = error instanceof Error ? error.message : String(error);
+  return /unique constraint|duplicate key|duplicate entry|SQLITE_CONSTRAINT_UNIQUE/i.test(message);
 }
