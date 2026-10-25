@@ -36,6 +36,9 @@ class ConflictModal extends Modal {
   private settled = false;
   private editing = false;
   private mergeInput: HTMLTextAreaElement | null = null;
+  private actionsEl: HTMLElement | null = null;
+  private followEl: HTMLElement | null = null;
+  private editSaveRow: HTMLElement | null = null;
 
   constructor(
     app: App,
@@ -43,6 +46,10 @@ class ConflictModal extends Modal {
     private readonly choose: (choice: ConflictChoice) => void,
   ) {
     super(app);
+  }
+
+  private canMerge(): boolean {
+    return this.view.kind === "content" && this.view.localText !== null && this.view.remoteText !== null;
   }
 
   onOpen(): void {
@@ -77,12 +84,23 @@ class ConflictModal extends Modal {
       this.mergeInput.value = merged.text;
       this.mergeInput.hidden = true;
     }
-    const actions = this.contentEl.createDiv({ cls: "e2ee-sync-actions" });
+    this.actionsEl = this.contentEl.createDiv({ cls: "e2ee-sync-actions" });
+    this.showMainActions();
+  }
+
+  private showMainActions(): void {
+    if (!this.actionsEl) return;
+    if (this.followEl) this.followEl.hidden = true;
+    if (this.editSaveRow) this.editSaveRow.hidden = !this.editing;
+    if (this.mergeInput) this.mergeInput.hidden = !this.editing;
+    const actions = this.actionsEl;
+    actions.empty();
+    const { view } = this;
     if (view.kind === "content") {
       this.button(actions, t("conflictKeepLocal"), () => this.finish({ action: "local" }));
       this.button(actions, t("conflictUseRemote"), () => this.finish({ action: "remote" }), true);
-      this.button(actions, t("conflictKeepBoth"), () => this.finish({ action: "both" }));
-      if (canMerge) {
+      this.button(actions, t("conflictKeepBoth"), () => this.showKeepBoth());
+      if (this.canMerge()) {
         const edit = this.button(actions, t("conflictEdit"), () => this.openEditor());
         edit.addClass("mod-cta");
       }
@@ -94,6 +112,52 @@ class ConflictModal extends Modal {
       this.button(actions, t("conflictDeleteRemote"), () => this.finish({ action: "local" }));
     }
     this.button(actions, t("conflictSkip"), () => this.finish({ action: "skip" }));
+  }
+
+  private showKeepBoth(): void {
+    if (!this.actionsEl) return;
+    if (!this.followEl) {
+      this.followEl = this.contentEl.createDiv({ cls: "e2ee-sync-both" });
+      this.actionsEl.before(this.followEl);
+    }
+    this.followEl.hidden = false;
+    this.followEl.empty();
+    this.followEl.createEl("h3", { text: t("conflictBothTitle") });
+    this.followEl.createEl("p", { text: t("conflictBothHelp") });
+    if (this.canMerge()) {
+      this.followEl.createEl("p", {
+        text: t("conflictBothSameFileDesc", { path: this.view.path }),
+        cls: "e2ee-sync-status-line",
+      });
+    } else {
+      this.followEl.createEl("p", { text: t("conflictBothBinary"), cls: "e2ee-sync-status-line" });
+    }
+    this.followEl.createEl("p", { text: t("conflictBothNewFileDesc"), cls: "e2ee-sync-status-line" });
+    if (this.mergeInput && !this.editing) this.mergeInput.hidden = true;
+    if (this.editSaveRow) this.editSaveRow.hidden = true;
+    const actions = this.actionsEl;
+    actions.empty();
+    const same = this.button(actions, t("conflictBothSameFile"), () => {
+      if (this.canMerge()) this.keepBothInFile();
+    });
+    if (this.canMerge()) same.addClass("mod-cta");
+    else if (same instanceof HTMLButtonElement) same.disabled = true;
+    this.button(actions, t("conflictBothNewFile"), () => this.finish({ action: "both" }));
+    this.button(actions, t("conflictBothBack"), () => this.showMainActions());
+  }
+
+  private keepBothInFile(): void {
+    if (!this.mergeInput || !this.actionsEl || !this.canMerge()) return;
+    this.mergeInput.hidden = false;
+    if (this.editSaveRow) this.editSaveRow.hidden = true;
+    this.mergeInput.focus();
+    const actions = this.actionsEl;
+    actions.empty();
+    const save = this.button(actions, t("conflictSaveMerge"), () => {
+      this.finish({ action: "merge", text: this.mergeInput?.value ?? "" });
+    });
+    save.addClass("mod-cta");
+    this.button(actions, t("conflictBothBack"), () => this.showKeepBoth());
   }
 
   onClose(): void {
@@ -124,8 +188,8 @@ class ConflictModal extends Modal {
     if (!this.mergeInput || this.editing) return;
     this.editing = true;
     this.mergeInput.hidden = false;
-    const row = this.contentEl.createDiv({ cls: "e2ee-sync-actions" });
-    const save = row.createEl("button", { text: t("conflictSaveMerge"), cls: "mod-cta" });
+    this.editSaveRow = this.contentEl.createDiv({ cls: "e2ee-sync-actions" });
+    const save = this.editSaveRow.createEl("button", { text: t("conflictSaveMerge"), cls: "mod-cta" });
     save.onclick = () => this.finish({ action: "merge", text: this.mergeInput?.value ?? "" });
   }
 
