@@ -167,9 +167,12 @@ function changeRegions(base: string[], edited: string[]): Region[] {
 }
 
 function markPair(local: string[], remote: string[], base: string[] | null): string[] {
-  const lines = ["<<<<<<< local", ...local];
-  if (base && base.length > 0) lines.push("||||||| base", ...base);
-  lines.push("=======", ...remote, ">>>>>>> remote");
+  // Obsidian Markdown: a lone "=======" is a setext H1 underline (blows up the
+  // previous line), and lines starting with ">" become purple blockquotes.
+  // Keep markers obvious but MD-inert.
+  const lines = ["<<<< LOCAL", ...local];
+  if (base && base.length > 0) lines.push("|||| BASE", ...base);
+  lines.push("==== REMOTE", ...remote, "<<<< END");
   return lines;
 }
 

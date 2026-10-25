@@ -12,7 +12,7 @@ test("identical notes stay unmarked", () => {
 
 test("a two-way merge marks only the changed lines", () => {
   const merged = mergeTexts("title\nalpha\nend\n", "title\nbeta\nend\n");
-  assert.match(merged.text, /title\n<<<<<<< local\nalpha\n=======\nbeta\n>>>>>>> remote\nend\n/);
+  assert.match(merged.text, /title\n<<<< LOCAL\nalpha\n==== REMOTE\nbeta\n<<<< END\nend\n/);
 });
 
 test("three-way keeps a one-sided edit and marks a real conflict", () => {
@@ -27,5 +27,5 @@ test("three-way keeps a one-sided edit and marks a real conflict", () => {
 test("three-way marks the same line changed on both sides", () => {
   const merged = mergeTexts("A\nX\nC\n", "A\nY\nC\n", "A\nB\nC\n");
   assert.equal(merged.threeWay, true);
-  assert.match(merged.text, /<<<<<<< local\nX\n\|\|\|\|\|\|\| base\nB\n=======\nY\n>>>>>>> remote/);
+  assert.match(merged.text, /<<<< LOCAL\nX\n\|\|\|\| BASE\nB\n==== REMOTE\nY\n<<<< END/);
 });
