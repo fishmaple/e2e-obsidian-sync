@@ -157,6 +157,7 @@ export class E2eeSettingTab extends PluginSettingTab {
         await new SyncClient(resolveSyncHost(this.plugin.settings.host), this.plugin.settings.apiToken).ensureVault(this.plugin.settings.boundVault, true);
         this.plugin.settings.encryptNotes = true;
         this.plugin.settings.index = {};
+        this.plugin.settings.changeCursor = null;
         await this.plugin.saveSettings();
         this.display();
         if (this.plugin.settings.secretKey.trim().length >= 16 && this.plugin.settings.boundVault) {
@@ -503,6 +504,7 @@ class SyncTypesModal extends Modal {
     this.plugin.settings.customSuffixes = [...this.custom];
     this.plugin.settings.syncSuffixes = [...this.selected];
     this.plugin.settings.syncOther = this.includeOther;
+    this.plugin.settings.changeCursor = null;
     await this.plugin.saveSettings();
     new Notice(t("suffixSaved"));
     this.close();

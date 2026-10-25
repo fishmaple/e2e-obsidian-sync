@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { bytesToBase64 } from "../../shared/src/codec";
 import { contentMac, decryptBytes, deriveKeys, encryptBytes, fileIdForPath, openBytes } from "../../shared/src/crypto";
-import type { Envelope, Manifest } from "../../shared/src/protocol";
+import type { ChangesResponse, ConflictBody, Envelope, Manifest, PutResult } from "../../shared/src/protocol";
 import { createApp } from "./app";
 import type { AppConfig } from "./config";
 import { openDatabase } from "./db";
@@ -432,6 +432,133 @@ test("the home page links to install, and a remote vault can be marked encrypted
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("object revisions reject a stale parent and changes are incremental", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "e2ee-rev-"));
+  const config = testConfig(dir, { requireEncryption: false });
+  const db = await openDatabase(config);
+  const app = createApp({ config, db });
+  try {
+    const apiToken = await devToken(app);
+    const fileId = "ab".repeat(32);
+    const otherId = "cd".repeat(32);
+    const vault = "笔记";
+    const first = plainObject(vault, "aa".repeat(32), "one");
+    const created = await authed(app, apiToken, "PUT", `/api/v1/objects/${fileId}`, first);
+    assert.equal(created.status, 200, await created.clone().text());
+    const createdBody = await created.json() as PutResult;
+    assert.equal(createdBody.rev, 1);
+
+    const second = plainObject(vault, "bb".repeat(32), "two", 1);
+    const updated = await authed(app, apiToken, "PUT", `/api/v1/objects/${fileId}`, second);
+    assert.equal(updated.status, 200, await updated.clone().text());
+    const updatedBody = await updated.json() as PutResult;
+    assert.equal(updatedBody.rev, 2);
+
+    const stale = plainObject(vault, "cc".repeat(32), "three", 1);
+    const conflict = await authed(app, apiToken, "PUT", `/api/v1/objects/${fileId}`, stale);
+    assert.equal(conflict.status, 409);
+    const conflictBody = await conflict.json() as ConflictBody;
+    assert.equal(conflictBody.reason, "parent_rev");
+    assert.equal(conflictBody.file?.rev, 2);
+    assert.equal(conflictBody.file?.contentMac, second.contentMac);
+    assert.equal(conflictBody.file?.mtime, second.mtime);
+    assert.equal(conflictBody.file?.encoding, "plain");
+
+    const blind = plainObject(vault, "dd".repeat(32), "four");
+    const blindConflict = await authed(app, apiToken, "PUT", `/api/v1/objects/${fileId}`, blind);
+    assert.equal(blindConflict.status, 409);
+    assert.equal((await blindConflict.json() as ConflictBody).reason, "parent_rev");
+
+    const same = plainObject(vault, second.contentMac, "two", 1);
+    const idempotent = await authed(app, apiToken, "PUT", `/api/v1/objects/${fileId}`, same);
+    assert.equal(idempotent.status, 200, await idempotent.clone().text());
+    assert.equal((await idempotent.json() as PutResult).rev, 2);
+
+    const other = await authed(app, apiToken, "PUT", `/api/v1/objects/${otherId}`, plainObject(vault, "ee".repeat(32), "other"));
+    assert.equal(other.status, 200, await other.clone().text());
+    const removed = await authed(app, apiToken, "POST", "/api/v1/deletions", {
+      vault,
+      ids: [fileId],
+      localCount: 1,
+    });
+    assert.equal(removed.status, 200);
+
+    const manifestRes = await authed(app, apiToken, "GET", `/api/v1/manifest?vault=${encodeURIComponent(vault)}`);
+    const manifest = await manifestRes.json() as Manifest;
+    assert.equal(manifest.files.length, 1);
+    assert.equal(manifest.files[0]?.fileId, otherId);
+    assert.equal(manifest.files[0]?.rev, 1);
+    assert.equal(typeof manifest.cursor, "number");
+    assert.ok((manifest.cursor ?? 0) >= 3);
+
+    const all = await authed(app, apiToken, "GET", `/api/v1/changes?vault=${encodeURIComponent(vault)}`);
+    assert.equal(all.status, 200);
+    const allBody = await all.json() as ChangesResponse;
+    assert.deepEqual(allBody.changes.map((change) => change.op), ["upsert", "upsert", "upsert", "delete"]);
+    assert.equal(allBody.changes[1]?.rev, 2);
+    assert.equal(allBody.changes[3]?.op, "delete");
+    assert.equal(allBody.changes[3]?.fileId, fileId);
+    const head = allBody.cursor;
+    const since = allBody.changes[1]?.seq ?? 0;
+    const page = await authed(app, apiToken, "GET", `/api/v1/changes?vault=${encodeURIComponent(vault)}&since=${since}`);
+    const pageBody = await page.json() as ChangesResponse;
+    assert.deepEqual(pageBody.changes.map((change) => change.seq), allBody.changes.slice(2).map((change) => change.seq));
+    assert.equal(pageBody.cursor, head);
+    assert.equal(pageBody.more, false);
+    const emptySince = await authed(app, apiToken, "GET", `/api/v1/changes?vault=${encodeURIComponent(vault)}&since=`);
+    const emptyBody = await emptySince.json() as ChangesResponse;
+    assert.equal(emptyBody.changes.length, allBody.changes.length);
+
+    const deletedParent = plainObject(vault, "ff".repeat(32), "gone", 2);
+    const gone = await authed(app, apiToken, "PUT", `/api/v1/objects/${fileId}`, deletedParent);
+    assert.equal(gone.status, 409);
+    const goneBody = await gone.json() as ConflictBody;
+    assert.equal(goneBody.reason, "deleted");
+    assert.equal(goneBody.file, null);
+  } finally {
+    await db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+function plainObject(vault: string, contentMac: string, text: string, parentRev?: number): {
+  vault: string;
+  pathCipher: { v: 0; raw: string };
+  contentCipher: { v: 0; raw: string };
+  contentMac: string;
+  size: number;
+  mtime: number;
+  encoding: "plain";
+  parentRev?: number;
+  parent_rev?: number;
+} {
+  const bytes = new TextEncoder().encode(text);
+  return {
+    vault,
+    pathCipher: { v: 0, raw: bytesToBase64(new TextEncoder().encode("a.md")) },
+    contentCipher: { v: 0, raw: bytesToBase64(bytes) },
+    contentMac,
+    size: bytes.byteLength,
+    mtime: 1700000000000,
+    encoding: "plain",
+    ...(parentRev === undefined ? {} : { parentRev, parent_rev: parentRev }),
+  };
+}
+
+async function devToken(app: ReturnType<typeof createApp>): Promise<string> {
+  const started = await app.request("http://127.0.0.1/api/v1/device/start", { method: "POST" });
+  const { deviceCode } = await started.json() as { deviceCode: string };
+  await app.request("http://127.0.0.1/auth/dev/login", {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ username: "rev-user", device: deviceCode }).toString(),
+    redirect: "manual",
+  });
+  const polled = await app.request(`http://127.0.0.1/api/v1/device/poll?code=${encodeURIComponent(deviceCode)}`);
+  const { apiToken } = await polled.json() as { apiToken: string };
+  return apiToken;
+}
 
 function testConfig(dir: string, extra: Partial<AppConfig> = {}): AppConfig {
   return {

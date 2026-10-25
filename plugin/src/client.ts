@@ -1,5 +1,15 @@
 import { requestUrl, type RequestUrlResponse } from "obsidian";
-import { normalizeHost, type Manifest, type ObjectPayload, type VaultStat } from "../../shared/src/protocol";
+import {
+  normalizeHost,
+  remoteRev,
+  type ChangesResponse,
+  type ConflictBody,
+  type Manifest,
+  type ObjectPayload,
+  type PutResult,
+  type RemoteFile,
+  type VaultStat,
+} from "../../shared/src/protocol";
 
 export function resolveSyncHost(input: string): string {
   return normalizeHost(input);
@@ -74,8 +84,32 @@ export class SyncClient {
     return this.authed("GET", `/api/v1/manifest?vault=${encodeURIComponent(vault)}`);
   }
 
-  putObject(fileId: string, payload: ObjectPayload): Promise<void> {
-    return this.authed("PUT", `/api/v1/objects/${fileId}`, payload);
+  changes(vault: string, since: number): Promise<ChangesResponse> {
+    const query = new URLSearchParams({ vault, since: String(since) });
+    return this.authed("GET", `/api/v1/changes?${query.toString()}`);
+  }
+
+  async putObject(fileId: string, payload: ObjectPayload): Promise<PutResult> {
+    const parentRev = payload.parentRev ?? null;
+    const bodyText = JSON.stringify({ ...payload, parentRev, parent_rev: parentRev });
+    const response = await send("PUT", `${this.host}/api/v1/objects/${fileId}`, {
+      authorization: `Bearer ${this.token}`,
+      "content-type": "application/json; charset=utf-8",
+    }, bodyText, this.onRetry);
+    const body = response.json as Partial<ConflictBody & PutResult> | null;
+    if (response.status === 409 && body && (body.reason === "parent_rev" || body.reason === "deleted")) {
+      throw new SyncConflictError(body.reason, conflictFile(body.file));
+    }
+    if (response.status >= 400) throw new Error(errorMessage(response));
+    return {
+      ok: true,
+      rev: typeof body?.rev === "number" ? body.rev : 0,
+      contentMac: typeof body?.contentMac === "string" ? body.contentMac : payload.contentMac,
+      mtime: typeof body?.mtime === "number" ? body.mtime : payload.mtime,
+      encoding: body?.encoding === "plain" || body?.encoding === "e2ee" ? body.encoding : payload.encoding,
+      size: typeof body?.size === "number" ? body.size : payload.size,
+      updatedAt: typeof body?.updatedAt === "number" ? body.updatedAt : Date.now(),
+    };
   }
 
   getObject(fileId: string): Promise<ObjectPayload> {
@@ -189,6 +223,26 @@ async function send(
     }
   }
   throw last instanceof Error ? last : new Error("Request failed");
+}
+
+export class SyncConflictError extends Error {
+  readonly status = 409;
+
+  constructor(
+    readonly reason: ConflictBody["reason"],
+    readonly file: RemoteFile | null,
+  ) {
+    super(reason === "deleted"
+      ? "The remote copy was deleted since this device last synced"
+      : "The remote copy changed since this device last synced");
+    this.name = "SyncConflictError";
+  }
+}
+
+function conflictFile(value: RemoteFile | null | undefined): RemoteFile | null {
+  if (!value || typeof value !== "object") return null;
+  if (typeof value.fileId !== "string" || typeof value.contentMac !== "string") return null;
+  return { ...value, rev: remoteRev(value) };
 }
 
 export class DuplicateVaultError extends Error {
