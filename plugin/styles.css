@@ -67,6 +67,14 @@
   width: min(860px, 92vw);
 }
 
+.e2ee-sync-conflict-modal button:disabled {
+  opacity: 0.45;
+}
+
+.e2ee-sync-both h3 {
+  margin-bottom: 4px;
+}
+
 .e2ee-sync-conflict-columns {
   display: grid;
   grid-template-columns: 1fr 1fr;
