@@ -2,9 +2,12 @@ import { serve } from "@hono/node-server";
 import { createApp } from "./app";
 import { loadConfig } from "./config";
 import { openDatabase } from "./db";
+import { migrateBlobLayout } from "./migrate";
+import { prepareStorage } from "./storage";
 
-const config = loadConfig();
+const config = await prepareStorage(loadConfig());
 const db = await openDatabase(config);
+const moved = await migrateBlobLayout(config, db);
 const app = createApp({ config, db });
 
 if (config.mode === "single") {
@@ -13,7 +16,8 @@ if (config.mode === "single") {
 } else {
   console.log("Central mode. Users receive an account ID after login.");
 }
-console.log(`Database: ${config.database.kind}, storage: ${config.storage.kind}, ${config.requireEncryption ? "encryption required" : "plaintext allowed"}`);
+const inline = config.storage.kind === "r2" ? `, inline under ${config.storage.inlineMaxBytes} bytes` : "";
+console.log(`Database: ${config.database.kind}, storage: ${config.storage.kind}${inline}, moved ${moved} blobs, ${config.requireEncryption ? "encryption required" : "plaintext allowed"}`);
 
 serve({ fetch: app.fetch, port: config.port, hostname: "0.0.0.0" }, (info) => {
   const shown = info.address === "0.0.0.0" ? "127.0.0.1" : info.address;

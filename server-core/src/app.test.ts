@@ -398,8 +398,8 @@ test("the home page links to install, and a remote vault can be marked encrypted
     assert.doesNotMatch(sh, /urlretrieve/);
     const latest = await app.request("http://127.0.0.1/plugin/e2ee-sync/latest");
     assert.equal(latest.status, 200);
-    assert.equal((await latest.text()).trim(), "0.3.1-beta");
-    const sums = await app.request("http://127.0.0.1/plugin/e2ee-sync/0.3.1-beta/SHA256SUMS");
+    assert.equal((await latest.text()).trim(), "0.3.2-beta-keepboth-md");
+    const sums = await app.request("http://127.0.0.1/plugin/e2ee-sync/0.3.2-beta-keepboth-md/SHA256SUMS");
     assert.equal(sums.status, 200);
     assert.match(await sums.text(), /[0-9a-f]{64}  main\.js/);
     const account = await app.request("http://127.0.0.1/install");

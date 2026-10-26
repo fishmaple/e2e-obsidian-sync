@@ -9,7 +9,7 @@
     "start": "node dist/index.js",
     "build": "node esbuild.config.mjs",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test src/app.test.ts src/config.test.ts ../shared/src/crypto.test.ts ../shared/src/merge.test.ts ../shared/src/reconcile.test.ts"
+    "test": "tsx --test src/app.test.ts src/config.test.ts src/storage.test.ts ../shared/src/crypto.test.ts ../shared/src/merge.test.ts ../shared/src/reconcile.test.ts"
   },
   "dependencies": {
     "@hono/node-server": "^1.19.6",

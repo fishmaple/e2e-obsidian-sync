@@ -564,6 +564,17 @@ export class SyncDb {
     await this.sql.run("INSERT INTO blobs (account_id, file_id, content) VALUES (?, ?, ?)", [accountId, fileId, content]);
   }
 
+  async listBlobs(): Promise<{ accountId: string; fileId: string; content: string }[]> {
+    const rows = await this.sql.all<{ account_id: string; file_id: string; content: string | Buffer }>(
+      "SELECT account_id, file_id, content FROM blobs",
+    );
+    return rows.map((row) => ({
+      accountId: row.account_id,
+      fileId: row.file_id,
+      content: typeof row.content === "string" ? row.content : Buffer.from(row.content).toString("utf8"),
+    }));
+  }
+
   async getBlob(accountId: string, fileId: string): Promise<string | undefined> {
     const row = await this.sql.get<{ content: string | Buffer }>(
       "SELECT content FROM blobs WHERE account_id = ? AND file_id = ?",

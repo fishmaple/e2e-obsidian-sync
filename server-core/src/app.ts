@@ -82,7 +82,7 @@ export function createApp(deps: AppDeps): Hono {
 
   app.get("/plugin/e2ee-sync/:version/:name", (c) => {
     const version = c.req.param("version");
-    if (!/^\d+\.\d+\.\d+(?:-beta(?:\.\d+)?)?$/.test(version) || version !== pluginVersion()) {
+    if (!/^\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?$/.test(version) || version.includes("..") || version !== pluginVersion()) {
       throw new HttpError(404, "Unknown version");
     }
     const name = c.req.param("name");
@@ -222,6 +222,7 @@ export function createApp(deps: AppDeps): Hono {
     protocol: PROTOCOL_VERSION,
     mode: config.mode,
     storage: config.storage.kind,
+    ...(config.storage.kind === "r2" ? { inlineMaxBytes: config.storage.inlineMaxBytes } : {}),
     database: config.database.kind,
     requireEncryption: config.requireEncryption,
     oidc: Boolean(config.oidc),
