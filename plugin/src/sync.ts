@@ -14,7 +14,7 @@ import type { FileIndexEntry } from "./main";
 export type RestoreMode = "overwrite" | "create";
 
 const RESTORE_BATCH = 100;
-const RESTORE_PARALLEL = 4;
+const TRANSFER_PARALLEL = 4;
 const BLOCKED = new Set([".obsidian", ".git", ".trash", "node_modules"]);
 const PLUGIN_FILES = new Set([
   ".obsidian/plugins/e2ee-sync/manifest.json",
@@ -83,6 +83,9 @@ export async function pushVault(plugin: E2eeSyncPlugin): Promise<string> {
   let deferCursor = false;
   const skippedLarge: string[] = [];
   const remoteDeletes: string[] = [];
+  const downloads: { file: RemoteFile; countMiss: boolean }[] = [];
+  const uploads: Parameters<typeof uploadTracked>[3][] = [];
+  const conflictJobs: Parameters<typeof pendingConflict>[1][] = [];
   const total = files.length + remote.size;
   const counts = () => uploaded + downloaded + unchanged + removed;
 
@@ -119,9 +122,7 @@ export async function pushVault(plugin: E2eeSyncPlugin): Promise<string> {
         deferCursor = true;
         continue;
       }
-      if (await pullRemote(plugin, ready, remoteFile, index)) downloaded++;
-      else unchanged++;
-      plugin.setStatus(t("syncProgress", { done: counts(), total }));
+      downloads.push({ file: remoteFile, countMiss: true });
       continue;
     }
     if (action.type === "upload") {
@@ -129,7 +130,7 @@ export async function pushVault(plugin: E2eeSyncPlugin): Promise<string> {
         skippedLarge.push(file.path);
         continue;
       }
-      const outcome = await uploadTracked(plugin, ready, index, {
+      uploads.push({
         fileId,
         path: file.path,
         plain,
@@ -141,9 +142,6 @@ export async function pushVault(plugin: E2eeSyncPlugin): Promise<string> {
         base: cached ?? null,
         remote: remoteFile,
       });
-      if (outcome === "uploaded") uploaded++;
-      else conflicts.push(outcome);
-      plugin.setStatus(t("syncProgress", { done: counts(), total }));
       continue;
     }
     if (action.type === "conflict") {
@@ -152,7 +150,7 @@ export async function pushVault(plugin: E2eeSyncPlugin): Promise<string> {
         deferCursor = true;
         continue;
       }
-      conflicts.push(await pendingConflict(ready, {
+      conflictJobs.push({
         fileId,
         path: file.path,
         kind: action.kind === "local-deleted" ? "content" : action.kind,
@@ -160,7 +158,7 @@ export async function pushVault(plugin: E2eeSyncPlugin): Promise<string> {
         remote: remoteFile,
         base: cached ?? null,
         encoding,
-      }));
+      });
       continue;
     }
   }
@@ -190,8 +188,7 @@ export async function pushVault(plugin: E2eeSyncPlugin): Promise<string> {
         deferCursor = true;
         continue;
       }
-      if (await pullRemote(plugin, ready, remoteFile, index)) downloaded++;
-      else unchanged++;
+      downloads.push({ file: remoteFile, countMiss: true });
       continue;
     }
     if (action.type === "conflict") {
@@ -201,7 +198,7 @@ export async function pushVault(plugin: E2eeSyncPlugin): Promise<string> {
         deferCursor = true;
         continue;
       }
-      conflicts.push(await pendingConflict(ready, {
+      conflictJobs.push({
         fileId,
         path: cached.path,
         kind: "local-deleted",
@@ -209,7 +206,7 @@ export async function pushVault(plugin: E2eeSyncPlugin): Promise<string> {
         remote: remoteFile,
         base: cached,
         encoding,
-      }));
+      });
     }
   }
 
@@ -226,9 +223,41 @@ export async function pushVault(plugin: E2eeSyncPlugin): Promise<string> {
       deferCursor = true;
       continue;
     }
-    if (await pullRemote(plugin, ready, remoteFile, index)) downloaded++;
-    plugin.setStatus(t("syncProgress", { done: counts(), total }));
+    downloads.push({ file: remoteFile, countMiss: false });
   }
+
+  const enqueue = createSerial();
+  const uploadConflicts: PendingConflict[] = new Array(uploads.length);
+  const fetchedConflicts: PendingConflict[] = new Array(conflictJobs.length);
+  const tasks: Array<() => Promise<void>> = [];
+  for (const item of downloads) {
+    tasks.push(async () => {
+      const saved = await pullRemote(plugin, ready, item.file, index, enqueue);
+      if (saved) downloaded++;
+      else if (item.countMiss) unchanged++;
+      plugin.setStatus(t("syncProgress", { done: counts(), total }));
+    });
+  }
+  for (let i = 0; i < uploads.length; i++) {
+    const input = uploads[i];
+    if (!input) continue;
+    tasks.push(async () => {
+      const outcome = await uploadTracked(plugin, ready, index, input);
+      if (outcome === "uploaded") uploaded++;
+      else uploadConflicts[i] = outcome;
+      plugin.setStatus(t("syncProgress", { done: counts(), total }));
+    });
+  }
+  for (let i = 0; i < conflictJobs.length; i++) {
+    const input = conflictJobs[i];
+    if (!input) continue;
+    tasks.push(async () => {
+      fetchedConflicts[i] = await pendingConflict(ready, input);
+    });
+  }
+  await runPool(tasks, TRANSFER_PARALLEL, (task) => task());
+  for (const item of uploadConflicts) if (item) conflicts.push(item);
+  for (const item of fetchedConflicts) if (item) conflicts.push(item);
 
   const device = deviceLabel();
   let resolved = 0;
@@ -728,6 +757,7 @@ async function pullRemote(
   ready: Awaited<ReturnType<typeof openClient>>,
   remoteFile: RemoteFile,
   index: E2eeSyncPlugin["settings"]["index"],
+  enqueue: <T>(fn: () => Promise<T>) => Promise<T>,
 ): Promise<boolean> {
   if (remoteFile.size > MAX_FILE_BYTES) return false;
   const known = index[remoteFile.fileId]?.path;
@@ -738,18 +768,20 @@ async function pullRemote(
   ));
   if (!shouldSync(plugin, path)) return false;
   const data = await openBytes(ready.keys?.encKey ?? null, stored.contentCipher, `body:${remoteFile.fileId}`);
-  await writeVaultFile(plugin.app.vault, path, data);
-  stampMtime(plugin, path, remoteFile.mtime);
-  const rev = remoteRev(remoteFile);
-  index[remoteFile.fileId] = {
-    path,
-    mtime: remoteFile.mtime,
-    size: data.byteLength,
-    contentMac: remoteFile.contentMac,
-    encoding: remoteFile.encoding,
-    syncedAt: Date.now(),
-    ...(rev > 0 ? { rev } : {}),
-  };
+  await enqueue(async () => {
+    await writeVaultFile(plugin.app.vault, path, data);
+    stampMtime(plugin, path, remoteFile.mtime);
+    const rev = remoteRev(remoteFile);
+    index[remoteFile.fileId] = {
+      path,
+      mtime: remoteFile.mtime,
+      size: data.byteLength,
+      contentMac: remoteFile.contentMac,
+      encoding: remoteFile.encoding,
+      syncedAt: Date.now(),
+      ...(rev > 0 ? { rev } : {}),
+    };
+  });
   return true;
 }
 
@@ -791,7 +823,7 @@ export async function restoreVault(
       if (!item) throw new Error("This file is not on the server");
       return item;
     });
-    await transferWindow(ordered, RESTORE_PARALLEL, async (item) => {
+    await transferWindow(ordered, TRANSFER_PARALLEL, async (item) => {
       const contentCipher = await client.fetchCipher(item.url);
       const path = safeVaultPath(new TextDecoder().decode(
         await openBytes(keys?.encKey ?? null, item.pathCipher, `path:${item.fileId}`),
@@ -849,6 +881,29 @@ export async function restoreVault(
     : t("overwritten", { vault: vaultName, count: restored });
   await plugin.saveSettings();
   return plugin.settings.lastSyncSummary;
+}
+
+function createSerial(): <T>(fn: () => Promise<T>) => Promise<T> {
+  let tail = Promise.resolve();
+  return (fn) => {
+    const run = tail.then(fn, fn);
+    tail = run.then(() => undefined, () => undefined);
+    return run;
+  };
+}
+
+async function runPool<T>(items: T[], limit: number, worker: (item: T) => Promise<void>): Promise<void> {
+  if (items.length === 0) return;
+  let next = 0;
+  const workers = Math.min(limit, items.length);
+  await Promise.all(Array.from({ length: workers }, async () => {
+    while (next < items.length) {
+      const current = next;
+      next += 1;
+      const item = items[current];
+      if (item !== undefined) await worker(item);
+    }
+  }));
 }
 
 async function transferWindow<T, R>(
