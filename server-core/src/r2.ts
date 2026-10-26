@@ -16,6 +16,10 @@ function blobKey(accountId: string, fileId: string): string {
   return `vaults/${accountId}/${fileId}`;
 }
 
+function stagingKey(accountId: string, fileId: string): string {
+  return `${blobKey(accountId, fileId)}.upload`;
+}
+
 const ACCOUNT_ID = /^[0-9a-f-]{36}$/i;
 const FILE_ID = /^[0-9a-f]{64}$/;
 
@@ -66,7 +70,81 @@ export class R2Client {
   }
 
   async delete(accountId: string, fileId: string): Promise<void> {
-    const response = await this.request("DELETE", blobKey(accountId, fileId));
+    await this.deleteKey(blobKey(accountId, fileId));
+  }
+
+  presignDownload(accountId: string, fileId: string, expiresSeconds: number): string {
+    return presignR2Url({
+      method: "GET",
+      endpoint: this.endpoint,
+      bucket: this.bucket,
+      key: blobKey(accountId, fileId),
+      accessKeyId: this.credentials.accessKeyId,
+      secretAccessKey: this.credentials.secretAccessKey,
+      expiresSeconds,
+    });
+  }
+
+  presignUpload(accountId: string, fileId: string, expiresSeconds: number): string {
+    return presignR2Url({
+      method: "PUT",
+      endpoint: this.endpoint,
+      bucket: this.bucket,
+      key: stagingKey(accountId, fileId),
+      accessKeyId: this.credentials.accessKeyId,
+      secretAccessKey: this.credentials.secretAccessKey,
+      expiresSeconds,
+    });
+  }
+
+  async stagingSize(accountId: string, fileId: string): Promise<number | undefined> {
+    const signed = signR2Request({
+      method: "HEAD",
+      endpoint: this.endpoint,
+      bucket: this.bucket,
+      key: stagingKey(accountId, fileId),
+      accessKeyId: this.credentials.accessKeyId,
+      secretAccessKey: this.credentials.secretAccessKey,
+    });
+    const response = await fetch(signed.url, {
+      method: "HEAD",
+      headers: signed.headers,
+      signal: AbortSignal.timeout(120000),
+    });
+    if (response.status === 404) return undefined;
+    if (!response.ok) throw new Error(`R2 head failed (${response.status})`);
+    const length = Number(response.headers.get("content-length"));
+    if (!Number.isSafeInteger(length) || length < 0) throw new Error("R2 head did not return a size");
+    return length;
+  }
+
+  async copyStaging(accountId: string, fileId: string): Promise<void> {
+    const source = `/${this.bucket}/${stagingKey(accountId, fileId).split("/").map(encodeRfc3986).join("/")}`;
+    const signed = signR2Request({
+      method: "PUT",
+      endpoint: this.endpoint,
+      bucket: this.bucket,
+      key: blobKey(accountId, fileId),
+      body: Buffer.alloc(0),
+      headers: { "x-amz-copy-source": source },
+      accessKeyId: this.credentials.accessKeyId,
+      secretAccessKey: this.credentials.secretAccessKey,
+    });
+    const response = await fetch(signed.url, {
+      method: "PUT",
+      headers: signed.headers,
+      body: new Uint8Array(0),
+      signal: AbortSignal.timeout(120000),
+    });
+    if (!response.ok) throw new Error(`R2 copy failed (${response.status})`);
+  }
+
+  async deleteStaging(accountId: string, fileId: string): Promise<void> {
+    await this.deleteKey(stagingKey(accountId, fileId));
+  }
+
+  private async deleteKey(key: string): Promise<void> {
+    const response = await this.request("DELETE", key);
     if (!response.ok && response.status !== 404) throw new Error(`R2 delete failed (${response.status})`);
   }
 
@@ -118,6 +196,7 @@ export function signR2Request(input: {
   key?: string;
   query?: Record<string, string>;
   body?: Buffer;
+  headers?: Record<string, string>;
   accessKeyId: string;
   secretAccessKey: string;
   now?: Date;
@@ -128,10 +207,19 @@ export function signR2Request(input: {
   const payload = input.body ?? Buffer.alloc(0);
   const payloadHash = sha256(payload);
   const host = new URL(input.endpoint).host;
-  const canonicalUri = `/${encodeRfc3986(input.bucket)}${input.key ? `/${input.key.split("/").map(encodeRfc3986).join("/")}` : ""}`;
+  const canonicalUri = objectUri(input.bucket, input.key);
   const canonicalQuery = canonicalQueryString(input.query ?? {});
-  const canonicalHeaders = `host:${host}\nx-amz-content-sha256:${payloadHash}\nx-amz-date:${amzDate}\n`;
-  const signedHeaders = "host;x-amz-content-sha256;x-amz-date";
+  const signed: Record<string, string> = {
+    host,
+    "x-amz-content-sha256": payloadHash,
+    "x-amz-date": amzDate,
+  };
+  for (const [name, value] of Object.entries(input.headers ?? {})) {
+    signed[name.toLowerCase()] = value.trim();
+  }
+  const names = Object.keys(signed).sort();
+  const canonicalHeaders = names.map((name) => `${name}:${signed[name]}\n`).join("");
+  const signedHeaders = names.join(";");
   const canonicalRequest = [
     input.method,
     canonicalUri,
@@ -144,15 +232,48 @@ export function signR2Request(input: {
   const stringToSign = `AWS4-HMAC-SHA256\n${amzDate}\n${scope}\n${sha256(canonicalRequest)}`;
   const signature = createHmac("sha256", signingKey(input.secretAccessKey, dateStamp)).update(stringToSign).digest("hex");
   const url = `${input.endpoint.replace(/\/$/, "")}${canonicalUri}${canonicalQuery ? `?${canonicalQuery}` : ""}`;
-  return {
-    url,
-    headers: {
-      Authorization: `AWS4-HMAC-SHA256 Credential=${input.accessKeyId}/${scope}, SignedHeaders=${signedHeaders}, Signature=${signature}`,
-      "x-amz-content-sha256": payloadHash,
-      "x-amz-date": amzDate,
-      host,
-    },
+  const headers: Record<string, string> = {
+    Authorization: `AWS4-HMAC-SHA256 Credential=${input.accessKeyId}/${scope}, SignedHeaders=${signedHeaders}, Signature=${signature}`,
   };
+  for (const name of names) headers[name] = signed[name] ?? "";
+  return { url, headers };
+}
+
+export function presignR2Url(input: {
+  method: "GET" | "PUT" | "DELETE";
+  endpoint: string;
+  bucket: string;
+  key: string;
+  accessKeyId: string;
+  secretAccessKey: string;
+  expiresSeconds: number;
+  now?: Date;
+}): string {
+  const now = input.now ?? new Date();
+  const amzDate = now.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
+  const dateStamp = amzDate.slice(0, 8);
+  const host = new URL(input.endpoint).host;
+  const scope = `${dateStamp}/auto/s3/aws4_request`;
+  const query = {
+    "X-Amz-Algorithm": "AWS4-HMAC-SHA256",
+    "X-Amz-Credential": `${input.accessKeyId}/${scope}`,
+    "X-Amz-Date": amzDate,
+    "X-Amz-Expires": String(input.expiresSeconds),
+    "X-Amz-SignedHeaders": "host",
+  };
+  const canonicalUri = objectUri(input.bucket, input.key);
+  const canonicalQuery = canonicalQueryString(query);
+  const canonicalRequest = [
+    input.method,
+    canonicalUri,
+    canonicalQuery,
+    `host:${host}\n`,
+    "host",
+    "UNSIGNED-PAYLOAD",
+  ].join("\n");
+  const stringToSign = `AWS4-HMAC-SHA256\n${amzDate}\n${scope}\n${sha256(canonicalRequest)}`;
+  const signature = createHmac("sha256", signingKey(input.secretAccessKey, dateStamp)).update(stringToSign).digest("hex");
+  return `${input.endpoint.replace(/\/$/, "")}${canonicalUri}?${canonicalQuery}&X-Amz-Signature=${signature}`;
 }
 
 export function parseObjectKey(key: string): { accountId: string; fileId: string } | undefined {
@@ -181,6 +302,12 @@ function signingKey(secret: string, dateStamp: string): Buffer {
   const region = createHmac("sha256", date).update("auto").digest();
   const service = createHmac("sha256", region).update("s3").digest();
   return createHmac("sha256", service).update("aws4_request").digest();
+}
+
+function objectUri(bucket: string, key?: string): string {
+  const prefix = `/${encodeRfc3986(bucket)}`;
+  if (!key) return prefix;
+  return `${prefix}/${key.split("/").map(encodeRfc3986).join("/")}`;
 }
 
 function canonicalQueryString(query: Record<string, string>): string {

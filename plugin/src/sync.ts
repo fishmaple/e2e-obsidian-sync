@@ -13,6 +13,8 @@ import type { FileIndexEntry } from "./main";
 
 export type RestoreMode = "overwrite" | "create";
 
+const RESTORE_BATCH = 100;
+const RESTORE_PARALLEL = 4;
 const BLOCKED = new Set([".obsidian", ".git", ".trash", "node_modules"]);
 const PLUGIN_FILES = new Set([
   ".obsidian/plugins/e2ee-sync/manifest.json",
@@ -523,7 +525,7 @@ async function pendingFromError(
 }
 
 async function downloadPlain(ready: ReadyClient, fileId: string): Promise<Uint8Array> {
-  const stored = await ready.client.getObject(fileId);
+  const stored = await ready.client.getObject(fileId, ready.vaultId);
   return openBytes(ready.keys?.encKey ?? null, stored.contentCipher, `body:${fileId}`);
 }
 
@@ -730,7 +732,7 @@ async function pullRemote(
   if (remoteFile.size > MAX_FILE_BYTES) return false;
   const known = index[remoteFile.fileId]?.path;
   if (known && !shouldSync(plugin, known)) return false;
-  const stored = await ready.client.getObject(remoteFile.fileId);
+  const stored = await ready.client.getObject(remoteFile.fileId, ready.vaultId);
   const path = safeVaultPath(new TextDecoder().decode(
     await openBytes(ready.keys?.encKey ?? null, stored.pathCipher, `path:${remoteFile.fileId}`),
   ));
@@ -778,17 +780,38 @@ export async function restoreVault(
   const destination = mode === "create" ? prepareRestoreFolder(plugin, folder) : "";
   const written: Array<{ path: string; fileId: string; contentMac: string; encoding: Encoding; rev: number }> = [];
   let restored = 0;
-  for (const file of manifest.files) {
-    const stored = await client.getObject(file.fileId);
-    const path = safeVaultPath(new TextDecoder().decode(
-      await openBytes(keys?.encKey ?? null, stored.pathCipher, `path:${file.fileId}`),
-    ));
-    const data = await openBytes(keys?.encKey ?? null, stored.contentCipher, `body:${file.fileId}`);
-    if (mode === "create") writeOutside(destination, path, data);
-    else await writeVaultFile(plugin.app.vault, path, data);
-    written.push({ path, fileId: file.fileId, contentMac: file.contentMac, encoding: file.encoding, rev: remoteRev(file) });
-    restored++;
-    plugin.setStatus(t("restoreProgress", { done: restored, total: manifest.files.length }));
+  const total = manifest.files.length;
+  for (let offset = 0; offset < total; offset += RESTORE_BATCH) {
+    const chunk = manifest.files.slice(offset, offset + RESTORE_BATCH);
+    const page = await client.urlList(vaultId, { downloads: chunk.map((file) => file.fileId) });
+    if (page.missing.length > 0) throw new Error("This file is not on the server");
+    const listed = new Map(page.downloads.map((item) => [item.fileId, item]));
+    const ordered = chunk.map((file) => {
+      const item = listed.get(file.fileId);
+      if (!item) throw new Error("This file is not on the server");
+      return item;
+    });
+    await transferWindow(ordered, RESTORE_PARALLEL, async (item) => {
+      const contentCipher = await client.fetchCipher(item.url);
+      const path = safeVaultPath(new TextDecoder().decode(
+        await openBytes(keys?.encKey ?? null, item.pathCipher, `path:${item.fileId}`),
+      ));
+      const data = await openBytes(keys?.encKey ?? null, contentCipher, `body:${item.fileId}`);
+      return { item, path, data };
+    }, async (loaded) => {
+      if (mode === "create") writeOutside(destination, loaded.path, loaded.data);
+      else await writeVaultFile(plugin.app.vault, loaded.path, loaded.data);
+      const file = chunk.find((entry) => entry.fileId === loaded.item.fileId);
+      written.push({
+        path: loaded.path,
+        fileId: loaded.item.fileId,
+        contentMac: loaded.item.contentMac,
+        encoding: loaded.item.encoding,
+        rev: remoteRev(file ?? loaded.item),
+      });
+      restored++;
+      plugin.setStatus(t("restoreProgress", { done: restored, total }));
+    });
   }
   if (mode === "overwrite") {
     await plugin.bindVault(vaultName, needsKey, vaultId);
@@ -826,6 +849,31 @@ export async function restoreVault(
     : t("overwritten", { vault: vaultName, count: restored });
   await plugin.saveSettings();
   return plugin.settings.lastSyncSummary;
+}
+
+async function transferWindow<T, R>(
+  items: T[],
+  limit: number,
+  worker: (item: T) => Promise<R>,
+  sink: (value: R) => Promise<void>,
+): Promise<void> {
+  const pending = new Map<number, Promise<R>>();
+  const start = (index: number) => {
+    const item = items[index];
+    if (item !== undefined) pending.set(index, worker(item));
+  };
+  for (let index = 0; index < items.length && index < limit; index++) start(index);
+  let next = Math.min(limit, items.length);
+  for (let done = 0; done < items.length; done++) {
+    const value = await pending.get(done);
+    if (value === undefined) throw new Error("The downloaded file was not valid ciphertext");
+    pending.delete(done);
+    await sink(value);
+    if (next < items.length) {
+      start(next);
+      next++;
+    }
+  }
 }
 
 export class RestoreModal extends Modal {

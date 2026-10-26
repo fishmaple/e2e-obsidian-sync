@@ -6,7 +6,7 @@ import test from "node:test";
 import type { AppConfig } from "./config";
 import { openDatabase } from "./db";
 import { migrateBlobLayout } from "./migrate";
-import { parseListObjects, parseObjectKey } from "./r2";
+import { parseListObjects, parseObjectKey, presignR2Url } from "./r2";
 import { HybridBlobStore, type BlobStore } from "./storage";
 
 const account = "123e4567-e89b-12d3-a456-426614174000";
@@ -110,6 +110,31 @@ test("database storage still accepts every object and file storage can take them
   assert.equal(await db.getBlob(account, largeId), undefined);
   assert.equal(existsSync(join(dir, "blobs", account, largeId)), true);
   await db.close();
+});
+
+test("presigned r2 urls bind the method, key, and expiry", () => {
+  const now = new Date("2026-01-02T03:04:05.000Z");
+  const input = {
+    endpoint: "https://example.r2.cloudflarestorage.com",
+    bucket: "e2e-sync",
+    key: `vaults/${account}/${smallId}`,
+    accessKeyId: "access-key",
+    secretAccessKey: "secret-key",
+    expiresSeconds: 3600,
+    now,
+  };
+  const download = presignR2Url({ ...input, method: "GET" });
+  const upload = presignR2Url({ ...input, method: "PUT" });
+  assert.equal(download, presignR2Url({ ...input, method: "GET" }));
+  assert.notEqual(download, upload);
+  const url = new URL(download);
+  assert.equal(url.host, "example.r2.cloudflarestorage.com");
+  assert.equal(url.pathname, `/e2e-sync/vaults/${account}/${smallId}`);
+  assert.equal(url.searchParams.get("X-Amz-Algorithm"), "AWS4-HMAC-SHA256");
+  assert.equal(url.searchParams.get("X-Amz-Expires"), "3600");
+  assert.equal(url.searchParams.get("X-Amz-SignedHeaders"), "host");
+  assert.match(url.searchParams.get("X-Amz-Signature") ?? "", /^[0-9a-f]{64}$/);
+  assert.match(url.searchParams.get("X-Amz-Credential") ?? "", /^access-key\/20260102\/auto\/s3\/aws4_request$/);
 });
 
 test("r2 list xml identifies vault objects", () => {

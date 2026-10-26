@@ -102,6 +102,35 @@ export interface ConflictBody {
   file: RemoteFile | null;
 }
 
+export interface SignedTransfer {
+  fileId: string;
+  url: string;
+  expiresAt: number;
+}
+
+export interface DownloadUrl extends SignedTransfer {
+  pathCipher: PayloadCipher;
+  contentMac: string;
+  size: number;
+  mtime: number;
+  updatedAt: number;
+  encoding: Encoding;
+  rev: number;
+}
+
+export interface UrlConflict {
+  fileId: string;
+  reason: "parent_rev" | "deleted";
+  file: RemoteFile | null;
+}
+
+export interface UrlListResponse {
+  downloads: DownloadUrl[];
+  uploads: SignedTransfer[];
+  conflicts: UrlConflict[];
+  missing: string[];
+}
+
 /** Positive integer revision, or 0 when the server did not send one. */
 export function remoteRev(file: { rev?: unknown }): number {
   const rev = file.rev;

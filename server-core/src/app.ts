@@ -15,8 +15,10 @@ import {
 } from "../../shared/src/protocol";
 import type { AppConfig } from "./config";
 import type { ObjectRow, SyncDb } from "./db";
+import { HttpError } from "./http-error";
 import { accessPage, accountPage, homePage, installPage, installPs1, installSh, loginPage, messagePage, obsidianReturnPage } from "./html";
 import { createBlobStore } from "./storage";
+import { acceptServerUpload, directRequestValid, discardUpload, finishUpload, listTransferUrls, serverDownload } from "./urls";
 import { completeOidcLogin, createOidcRequest } from "./oidc";
 import { clearCookieHeader, openSession, readCookie, sealSession, sessionCookieName, setCookieHeader } from "./session";
 
@@ -26,11 +28,7 @@ const LOGIN_STATE = /^[A-Za-z0-9_-]{22,128}$/;
 const USERNAME = /^[^\u0000-\u001f\u007f]{2,64}$/;
 const VAULT_NAME = /^[^\u0000-\u001f\u007f\\/]{1,120}$/;
 
-export class HttpError extends Error {
-  constructor(readonly status: number, message: string) {
-    super(message);
-  }
-}
+export { HttpError } from "./http-error";
 
 export interface AppDeps {
   config: AppConfig;
@@ -349,6 +347,110 @@ export function createApp(deps: AppDeps): Hono {
     const limit = parseLimit(c.req.query("limit"));
     const page = await db.listChanges(accountId, name, since, limit);
     return c.json({ since, cursor: page.cursor, more: page.more, changes: page.changes });
+  });
+
+  api.post("/urls", async (c) => {
+    const { accountId } = await requireToken(c);
+    const body = parseJson(await readBody(c, 1024 * 1024)) as { vault?: unknown; downloads?: unknown; uploads?: unknown };
+    const vaultName = await vaultNameFromQuery(accountId, typeof body.vault === "string" ? body.vault : undefined);
+    const listed = await listTransferUrls({
+      config,
+      db,
+      accountId,
+      vaultName,
+      origin: publicOrigin(c),
+      downloads: stringList(body.downloads),
+      uploads: uploadList(body.uploads),
+    });
+    return c.json(listed);
+  });
+
+  api.post("/objects/:fileId/commit", async (c) => {
+    const fileId = c.req.param("fileId");
+    if (!FILE_ID.test(fileId)) throw new HttpError(400, "Invalid file ID");
+    const { accountId } = await requireToken(c);
+    const payload = parseCommitPayload(parseJson(await readBody(c)), config.requireEncryption);
+    const named = payload.vaultId ? await db.findVaultById(accountId, payload.vaultId) : undefined;
+    if (payload.vaultId && !named) throw new HttpError(404, "The remote vault does not exist");
+    const vaultName = named?.name ?? payload.vault;
+    if (payload.encoding !== "e2ee" && await db.vaultEncrypted(accountId, vaultName)) {
+      throw new HttpError(409, "This vault is encrypted and no longer accepts plaintext");
+    }
+    const grant = await db.getUploadGrant(accountId, fileId);
+    if (!grant || grant.expiresAt <= Date.now()) throw new HttpError(400, "The upload URL has expired");
+    if (grant.bytes !== payload.blobBytes) throw new HttpError(400, "Uploaded object size does not match");
+    const result = await db.putObjectRevision({
+      accountId,
+      fileId,
+      vaultName,
+      pathCipher: JSON.stringify(payload.pathCipher),
+      contentMac: payload.contentMac,
+      size: payload.size,
+      mtime: payload.mtime,
+      encoding: payload.encoding,
+    }, payload.parentRev ?? null, async () => {
+      await finishUpload(config, db, blobs, accountId, fileId, payload.encoding);
+    });
+    try {
+      await discardUpload(config, db, accountId, fileId);
+    } catch {
+      console.error("Failed to clear an upload slot");
+    }
+    if (result.status === "conflict") {
+      const deleted = result.reason === "deleted";
+      return c.json({
+        error: deleted
+          ? "The remote copy was deleted since this device last synced"
+          : "The remote copy changed since this device last synced",
+        reason: result.reason,
+        file: result.current ? toRemoteFile(result.current) : null,
+      }, 409);
+    }
+    await db.rememberVault(accountId, vaultName, payload.encoding === "e2ee");
+    return c.json({
+      ok: true,
+      rev: result.row.rev,
+      contentMac: result.row.contentMac,
+      mtime: result.row.mtime,
+      encoding: result.row.encoding,
+      size: result.row.size,
+      updatedAt: result.row.updatedAt,
+    });
+  });
+
+  api.put("/direct/:accountId/:fileId", async (c) => {
+    const accountId = c.req.param("accountId");
+    const fileId = c.req.param("fileId");
+    if (!directAccount(accountId) || !FILE_ID.test(fileId) || !directRequestValid(
+      config.sessionSecret,
+      "PUT",
+      accountId,
+      fileId,
+      c.req.query("exp") ?? "",
+      c.req.query("sig") ?? "",
+    )) {
+      throw new HttpError(401, "The signed URL is invalid or expired");
+    }
+    await acceptServerUpload(config, db, accountId, fileId, Buffer.from(await readBody(c)));
+    return new Response(null, { status: 204 });
+  });
+
+  api.get("/direct/:accountId/:fileId", async (c) => {
+    const accountId = c.req.param("accountId");
+    const fileId = c.req.param("fileId");
+    if (!directAccount(accountId) || !FILE_ID.test(fileId) || !directRequestValid(
+      config.sessionSecret,
+      "GET",
+      accountId,
+      fileId,
+      c.req.query("exp") ?? "",
+      c.req.query("sig") ?? "",
+    )) {
+      throw new HttpError(401, "The signed URL is invalid or expired");
+    }
+    c.header("content-type", "application/json; charset=utf-8");
+    c.header("cache-control", "no-store");
+    return c.body(await serverDownload(blobs, accountId, fileId));
   });
 
   api.put("/objects/:fileId", async (c) => {
@@ -710,6 +812,58 @@ function parseCipher(value: unknown, requireEncryption: boolean): PayloadCipher 
   }
   if (record.iv.length > 64 || record.ct.length > MAX_BODY_BYTES) throw new HttpError(413, "Ciphertext is too large");
   return { v: 1, iv: record.iv, ct: record.ct };
+}
+
+function stringList(value: unknown): string[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) throw new HttpError(400, "Invalid URL list");
+  return value;
+}
+
+function uploadList(value: unknown): { fileId: string; parentRev: number | null; bytes: number }[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw new HttpError(400, "Invalid URL list");
+  return value.map((item) => {
+    if (!item || typeof item !== "object") throw new HttpError(400, "Invalid URL list");
+    const record = item as { fileId?: unknown; bytes?: unknown };
+    if (typeof record.fileId !== "string" || typeof record.bytes !== "number") throw new HttpError(400, "Invalid URL list");
+    return { fileId: record.fileId, parentRev: parseParentRev(item), bytes: record.bytes };
+  });
+}
+
+function directAccount(accountId: string): boolean {
+  return /^[0-9a-f-]{36}$/i.test(accountId);
+}
+
+function parseCommitPayload(value: unknown, requireEncryption: boolean): Omit<ObjectPayload, "contentCipher"> & { blobBytes: number } {
+  if (!value || typeof value !== "object") throw new HttpError(400, "Invalid request");
+  const body = value as Partial<ObjectPayload> & { blobBytes?: unknown };
+  if (typeof body.contentMac !== "string" || !/^[0-9a-f]{64}$/.test(body.contentMac)) {
+    throw new HttpError(400, "Invalid content fingerprint");
+  }
+  if (body.encoding !== "e2ee" && body.encoding !== "plain") throw new HttpError(400, "Invalid encryption flag");
+  if (requireEncryption && body.encoding !== "e2ee") throw new HttpError(400, "The server requires encryption and rejected plaintext");
+  if (typeof body.size !== "number" || !Number.isInteger(body.size) || body.size < 0 || body.size > MAX_FILE_BYTES) {
+    throw new HttpError(400, "Invalid file size");
+  }
+  if (typeof body.mtime !== "number" || !Number.isFinite(body.mtime)) throw new HttpError(400, "Invalid modification time");
+  if (typeof body.blobBytes !== "number" || !Number.isSafeInteger(body.blobBytes) || body.blobBytes < 0 || body.blobBytes > MAX_BODY_BYTES) {
+    throw new HttpError(400, "Invalid upload size");
+  }
+  const pathCipher = parseCipher(body.pathCipher, requireEncryption);
+  const encoding: Encoding = body.encoding;
+  if (cipherEncoding(pathCipher) !== encoding) throw new HttpError(400, "Ciphertext format does not match the encryption flag");
+  return {
+    vault: parseVaultName(typeof body.vault === "string" ? body.vault : undefined),
+    vaultId: typeof body.vaultId === "string" ? body.vaultId : "",
+    pathCipher,
+    contentMac: body.contentMac,
+    size: body.size,
+    mtime: body.mtime,
+    encoding,
+    parentRev: parseParentRev(value),
+    blobBytes: body.blobBytes,
+  };
 }
 
 function parseObjectPayload(value: unknown, requireEncryption: boolean): ObjectPayload {
