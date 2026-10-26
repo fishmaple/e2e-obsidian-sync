@@ -14,7 +14,13 @@ import type { FileIndexEntry } from "./main";
 export type RestoreMode = "overwrite" | "create";
 
 const RESTORE_BATCH = 100;
-const TRANSFER_PARALLEL = 4;
+const TRANSFER_PARALLEL_DEFAULT = 10;
+const TRANSFER_PARALLEL_MAX = 20;
+
+export function clampTransferParallel(value: number): number {
+  if (!Number.isFinite(value)) return TRANSFER_PARALLEL_DEFAULT;
+  return Math.min(TRANSFER_PARALLEL_MAX, Math.max(1, Math.floor(value)));
+}
 const BLOCKED = new Set([".obsidian", ".git", ".trash", "node_modules"]);
 const PLUGIN_FILES = new Set([
   ".obsidian/plugins/e2ee-sync/manifest.json",
@@ -255,7 +261,7 @@ export async function pushVault(plugin: E2eeSyncPlugin): Promise<string> {
       fetchedConflicts[i] = await pendingConflict(ready, input);
     });
   }
-  await runPool(tasks, TRANSFER_PARALLEL, (task) => task());
+  await runPool(tasks, clampTransferParallel(plugin.settings.transferParallel), (task) => task());
   for (const item of uploadConflicts) if (item) conflicts.push(item);
   for (const item of fetchedConflicts) if (item) conflicts.push(item);
 
@@ -823,7 +829,7 @@ export async function restoreVault(
       if (!item) throw new Error("This file is not on the server");
       return item;
     });
-    await transferWindow(ordered, TRANSFER_PARALLEL, async (item) => {
+    await transferWindow(ordered, clampTransferParallel(plugin.settings.transferParallel), async (item) => {
       const contentCipher = await client.fetchCipher(item.url);
       const path = safeVaultPath(new TextDecoder().decode(
         await openBytes(keys?.encKey ?? null, item.pathCipher, `path:${item.fileId}`),
