@@ -40,10 +40,13 @@ export async function migrateBlobLayout(config: AppConfig, db: SyncDb, remote?: 
 
   let moved = 0;
   if (!(same && target === "file")) {
-    for (const file of listFileBlobs(config.dataDir)) {
+    const files = listFileBlobs(config.dataDir);
+    if (files.length > 0) console.log(`Moving ${files.length} file blobs to ${target}`);
+    for (const file of files) {
       const json = readFileSync(file.path, "utf8");
       await place(config, db, active, legacyR2, file.accountId, file.fileId, json);
       moved++;
+      if (moved % 50 === 0) console.log(`Moved ${moved} file blobs`);
     }
   }
 

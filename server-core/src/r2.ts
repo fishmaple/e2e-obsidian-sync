@@ -105,6 +105,7 @@ export class R2Client {
       method,
       headers: signed.headers,
       body: body ? new Uint8Array(body) : undefined,
+      signal: AbortSignal.timeout(30000),
     });
     return { ok: response.ok, status: response.status, body: new Uint8Array(await response.arrayBuffer()) };
   }

@@ -36,6 +36,7 @@ Environment=PORT=$PORT
 Environment=DATA_DIR=$DATA_DIR
 Environment=SERVER_MODE=central
 Environment=REQUIRE_ENCRYPTION=false
+Environment=NODE_OPTIONS=--dns-result-order=ipv4first
 ExecStart=$(command -v node) dist/index.js
 Restart=on-failure
 RestartSec=3
@@ -49,7 +50,7 @@ systemctl enable e2ee-sync
 systemctl restart e2ee-sync
 systemctl is-active e2ee-sync
 ready=0
-for _ in $(seq 1 48); do
+for _ in $(seq 1 120); do
   if curl -fsS "http://127.0.0.1:${PORT}/api/v1/health"; then
     ready=1
     echo
