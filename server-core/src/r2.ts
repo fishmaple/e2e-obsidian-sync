@@ -22,6 +22,7 @@ const FILE_ID = /^[0-9a-f]{64}$/;
 export async function credentialsFromApiToken(token: string): Promise<R2Credentials> {
   const response = await fetch("https://api.cloudflare.com/client/v4/user/tokens/verify", {
     headers: { Authorization: `Bearer ${token}` },
+    signal: AbortSignal.timeout(15000),
   });
   const body = await response.json() as { success?: boolean; result?: { id?: string; status?: string } };
   const accessKeyId = body.result?.id?.trim() ?? "";

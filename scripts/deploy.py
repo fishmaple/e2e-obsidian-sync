@@ -79,8 +79,13 @@ def main() -> None:
 
 
 def app_env_text() -> str:
+    skip = set()
+    if os.environ.get("R2_ACCESS_KEY_ID", "").strip() and os.environ.get("R2_SECRET_ACCESS_KEY", "").strip():
+        skip.add("R2_API_TOKEN")
     lines = []
     for key in APP_ENV_KEYS:
+        if key in skip:
+            continue
         value = os.environ.get(key, "").strip()
         if value:
             lines.append(f"{key}={value}")
