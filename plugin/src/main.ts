@@ -9,7 +9,7 @@ import { promptBind } from "./bind-prompt";
 import { hasActiveBinding } from "./binding";
 import { allSuffixes } from "./file-kinds";
 import { E2eeSettingTab } from "./settings";
-import { RestoreModal, isSyncablePath, propagatePlugin, pushVault, restoreVault, type RestoreMode } from "./sync";
+import { RestoreModal, clampTransferParallel, isSyncablePath, propagatePlugin, pushVault, restoreVault, type RestoreMode } from "./sync";
 
 export interface FileIndexEntry {
   path: string;
@@ -42,6 +42,7 @@ export interface SyncSettings {
   vaultBindings: Record<string, VaultBinding>;
   autoSync: boolean;
   autoSyncSeconds: number;
+  transferParallel: number;
   syncSuffixes: string[];
   customSuffixes: string[];
   syncOther: boolean;
@@ -67,6 +68,7 @@ const DEFAULT_SETTINGS: SyncSettings = {
   vaultBindings: {},
   autoSync: true,
   autoSyncSeconds: 30,
+  transferParallel: 10,
   syncSuffixes: allSuffixes(),
   customSuffixes: [],
   syncOther: true,
@@ -176,6 +178,8 @@ export default class E2eeSyncPlugin extends Plugin {
     } else {
       this.settings.autoSyncSeconds = clampAutoSyncSeconds(this.settings.autoSyncSeconds);
     }
+    const parallel = this.settings.transferParallel;
+    this.settings.transferParallel = clampTransferParallel(typeof parallel === "number" ? parallel : 10);
     const known = new Set(allSuffixes());
     const storedCustom = rest.customSuffixes;
     const custom = Array.isArray(storedCustom)

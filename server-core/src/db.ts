@@ -564,6 +564,17 @@ export class SyncDb {
     await this.sql.run("INSERT INTO blobs (account_id, file_id, content) VALUES (?, ?, ?)", [accountId, fileId, content]);
   }
 
+  async listBlobs(): Promise<{ accountId: string; fileId: string; content: string }[]> {
+    const rows = await this.sql.all<{ account_id: string; file_id: string; content: string | Buffer }>(
+      "SELECT account_id, file_id, content FROM blobs",
+    );
+    return rows.map((row) => ({
+      accountId: row.account_id,
+      fileId: row.file_id,
+      content: typeof row.content === "string" ? row.content : Buffer.from(row.content).toString("utf8"),
+    }));
+  }
+
   async getBlob(accountId: string, fileId: string): Promise<string | undefined> {
     const row = await this.sql.get<{ content: string | Buffer }>(
       "SELECT content FROM blobs WHERE account_id = ? AND file_id = ?",
@@ -593,6 +604,68 @@ export class SyncDb {
 
   async deleteBlob(accountId: string, fileId: string): Promise<void> {
     await this.sql.run("DELETE FROM blobs WHERE account_id = ? AND file_id = ?", [accountId, fileId]);
+  }
+
+  async putUploadGrant(accountId: string, fileId: string, bytes: number, kind: "server" | "r2", expiresAt: number): Promise<void> {
+    const existing = await this.sql.get<{ file_id: string }>(
+      "SELECT file_id FROM upload_grants WHERE account_id = ? AND file_id = ?",
+      [accountId, fileId],
+    );
+    if (existing) {
+      await this.sql.run(
+        "UPDATE upload_grants SET bytes = ?, kind = ?, expires_at = ? WHERE account_id = ? AND file_id = ?",
+        [bytes, kind, expiresAt, accountId, fileId],
+      );
+      return;
+    }
+    await this.sql.run(
+      "INSERT INTO upload_grants (account_id, file_id, bytes, kind, expires_at) VALUES (?, ?, ?, ?, ?)",
+      [accountId, fileId, bytes, kind, expiresAt],
+    );
+  }
+
+  async getUploadGrant(accountId: string, fileId: string): Promise<{ bytes: number; kind: "server" | "r2"; expiresAt: number } | undefined> {
+    const row = await this.sql.get<{ bytes: number | string; kind: string; expires_at: number | string }>(
+      "SELECT bytes, kind, expires_at FROM upload_grants WHERE account_id = ? AND file_id = ?",
+      [accountId, fileId],
+    );
+    if (!row || (row.kind !== "server" && row.kind !== "r2")) return undefined;
+    return { bytes: Number(row.bytes), kind: row.kind, expiresAt: Number(row.expires_at) };
+  }
+
+  async deleteUploadGrant(accountId: string, fileId: string): Promise<void> {
+    await this.sql.run("DELETE FROM upload_grants WHERE account_id = ? AND file_id = ?", [accountId, fileId]);
+  }
+
+  async putUploadBody(accountId: string, fileId: string, content: string): Promise<void> {
+    const existing = await this.sql.get<{ file_id: string }>(
+      "SELECT file_id FROM upload_bodies WHERE account_id = ? AND file_id = ?",
+      [accountId, fileId],
+    );
+    if (existing) {
+      await this.sql.run(
+        "UPDATE upload_bodies SET content = ? WHERE account_id = ? AND file_id = ?",
+        [content, accountId, fileId],
+      );
+      return;
+    }
+    await this.sql.run(
+      "INSERT INTO upload_bodies (account_id, file_id, content) VALUES (?, ?, ?)",
+      [accountId, fileId, content],
+    );
+  }
+
+  async getUploadBody(accountId: string, fileId: string): Promise<string | undefined> {
+    const row = await this.sql.get<{ content: string | Buffer }>(
+      "SELECT content FROM upload_bodies WHERE account_id = ? AND file_id = ?",
+      [accountId, fileId],
+    );
+    if (!row) return undefined;
+    return typeof row.content === "string" ? row.content : Buffer.from(row.content).toString("utf8");
+  }
+
+  async deleteUploadBody(accountId: string, fileId: string): Promise<void> {
+    await this.sql.run("DELETE FROM upload_bodies WHERE account_id = ? AND file_id = ?", [accountId, fileId]);
   }
 
   private async appendChange(row: ObjectRow, op: "upsert" | "delete"): Promise<void> {
@@ -754,6 +827,20 @@ function schema(dialect: Queryable["dialect"]): string[] {
       PRIMARY KEY (account_id, vault_name, seq)
     )`,
     `CREATE TABLE IF NOT EXISTS blobs (
+      account_id VARCHAR(64) NOT NULL,
+      file_id VARCHAR(64) NOT NULL,
+      content ${large} NOT NULL,
+      PRIMARY KEY (account_id, file_id)
+    )`,
+    `CREATE TABLE IF NOT EXISTS upload_grants (
+      account_id VARCHAR(64) NOT NULL,
+      file_id VARCHAR(64) NOT NULL,
+      bytes BIGINT NOT NULL,
+      kind VARCHAR(16) NOT NULL,
+      expires_at BIGINT NOT NULL,
+      PRIMARY KEY (account_id, file_id)
+    )`,
+    `CREATE TABLE IF NOT EXISTS upload_bodies (
       account_id VARCHAR(64) NOT NULL,
       file_id VARCHAR(64) NOT NULL,
       content ${large} NOT NULL,

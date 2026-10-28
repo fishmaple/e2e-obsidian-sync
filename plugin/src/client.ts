@@ -4,10 +4,13 @@ import {
   remoteRev,
   type ChangesResponse,
   type ConflictBody,
+  type DownloadUrl,
   type Manifest,
   type ObjectPayload,
+  type PayloadCipher,
   type PutResult,
   type RemoteFile,
+  type UrlListResponse,
   type VaultStat,
 } from "../../shared/src/protocol";
 
@@ -18,7 +21,7 @@ export function resolveSyncHost(input: string): string {
 export interface ServerHealth {
   ok: boolean;
   mode: "central" | "single";
-  storage: "file" | "database" | "qiniu";
+  storage: "file" | "database" | "qiniu" | "r2";
   database: "sqlite" | "postgres" | "mysql";
   requireEncryption: boolean;
   oidc: boolean;
@@ -90,12 +93,33 @@ export class SyncClient {
   }
 
   async putObject(fileId: string, payload: ObjectPayload): Promise<PutResult> {
+    const content = JSON.stringify(payload.contentCipher);
+    const bytes = new TextEncoder().encode(content).byteLength;
     const parentRev = payload.parentRev ?? null;
-    const bodyText = JSON.stringify({ ...payload, parentRev, parent_rev: parentRev });
-    const response = await send("PUT", `${this.host}/api/v1/objects/${fileId}`, {
+    const listed = await this.urlList(payload.vaultId || payload.vault, {
+      uploads: [{ fileId, parentRev, bytes }],
+    });
+    const conflict = listed.conflicts.find((item) => item.fileId === fileId);
+    if (conflict) throw new SyncConflictError(conflict.reason, conflictFile(conflict.file));
+    const upload = listed.uploads.find((item) => item.fileId === fileId);
+    if (!upload) throw new Error("The server did not return an upload URL");
+    const sent = await transfer("PUT", upload.url, content);
+    if (sent.status >= 400) throw new Error(errorMessage(sent));
+    const response = await send("POST", `${this.host}/api/v1/objects/${fileId}/commit`, {
       authorization: `Bearer ${this.token}`,
       "content-type": "application/json; charset=utf-8",
-    }, bodyText, this.onRetry);
+    }, JSON.stringify({
+      vault: payload.vault,
+      vaultId: payload.vaultId,
+      pathCipher: payload.pathCipher,
+      contentMac: payload.contentMac,
+      size: payload.size,
+      mtime: payload.mtime,
+      encoding: payload.encoding,
+      parentRev,
+      parent_rev: parentRev,
+      blobBytes: bytes,
+    }), this.onRetry);
     const body = response.json as Partial<ConflictBody & PutResult> | null;
     if (response.status === 409 && body && (body.reason === "parent_rev" || body.reason === "deleted")) {
       throw new SyncConflictError(body.reason, conflictFile(body.file));
@@ -112,8 +136,46 @@ export class SyncClient {
     };
   }
 
-  getObject(fileId: string): Promise<ObjectPayload> {
-    return this.authed("GET", `/api/v1/objects/${fileId}`);
+  async getObject(fileId: string, vaultId: string): Promise<ObjectPayload> {
+    const listed = await this.urlList(vaultId, { downloads: [fileId] });
+    if (listed.missing.includes(fileId)) throw new Error("This file is not on the server");
+    const item = listed.downloads.find((entry) => entry.fileId === fileId);
+    if (!item) throw new Error("This file is not on the server");
+    return this.readObject(item);
+  }
+
+  urlList(vault: string, query: { downloads?: string[]; uploads?: { fileId: string; parentRev?: number | null; bytes: number }[] }): Promise<UrlListResponse> {
+    return this.authed<UrlListResponse>("POST", "/api/v1/urls", {
+      vault,
+      downloads: query.downloads ?? [],
+      uploads: query.uploads ?? [],
+    }).then(normalizeUrlList);
+  }
+
+  async readObject(item: DownloadUrl): Promise<ObjectPayload> {
+    const contentCipher = await this.fetchCipher(item.url);
+    return {
+      vault: "",
+      pathCipher: item.pathCipher,
+      contentCipher,
+      contentMac: item.contentMac,
+      size: item.size,
+      mtime: item.mtime,
+      encoding: item.encoding,
+    };
+  }
+
+  async fetchCipher(url: string): Promise<PayloadCipher> {
+    const response = await transfer("GET", url);
+    if (response.status === 404) throw new Error("This file is not on the server");
+    if (response.status >= 400) throw new Error(errorMessage(response));
+    try {
+      const parsed = JSON.parse(response.text) as PayloadCipher;
+      if (!parsed || (parsed.v !== 0 && parsed.v !== 1)) throw new Error("invalid");
+      return parsed;
+    } catch {
+      throw new Error("The downloaded file was not valid ciphertext");
+    }
   }
 
   deleteObjects(vault: string, ids: string[], localCount: number, clearUnnamed = false): Promise<{ deleted: number }> {
@@ -189,12 +251,26 @@ function delay(ms: number): Promise<void> {
   });
 }
 
+function normalizeUrlList(value: UrlListResponse): UrlListResponse {
+  return {
+    downloads: Array.isArray(value?.downloads) ? value.downloads : [],
+    uploads: Array.isArray(value?.uploads) ? value.uploads : [],
+    conflicts: Array.isArray(value?.conflicts) ? value.conflicts : [],
+    missing: Array.isArray(value?.missing) ? value.missing : [],
+  };
+}
+
+async function transfer(method: "GET" | "PUT", url: string, body?: string): Promise<RequestUrlResponse> {
+  return send(method, url, body === undefined ? undefined : { "content-type": "application/json; charset=utf-8" }, body, undefined, 120_000);
+}
+
 async function send(
   method: string,
   url: string,
   headers?: Record<string, string>,
   body?: string,
   onRetry?: (seconds: number) => void,
+  timeoutMs = 0,
 ): Promise<RequestUrlResponse> {
   const path = new URL(url).pathname;
   const retryable = method === "GET" || method === "PUT";
@@ -202,7 +278,7 @@ async function send(
   let last: unknown;
   for (let attempt = 0; attempt < attempts; attempt++) {
     try {
-      const ms = path.startsWith("/api/v1/objects/") ? 120_000 : 30_000;
+      const ms = timeoutMs || (path.startsWith("/api/v1/objects/") ? 120_000 : 30_000);
       const response = await withTimeout(requestUrl({
         url,
         method,

@@ -16,6 +16,9 @@ fi
 node -v
 
 mkdir -p "$APP_DIR" "$DATA_DIR"
+if [ -f /etc/e2ee-sync.env ]; then
+  chmod 600 /etc/e2ee-sync.env
+fi
 tar -xzf /tmp/e2ee-sync-server.tgz -C "$APP_DIR"
 cat > "$APP_DIR/package.json" <<'EOF'
 { "type": "module", "private": true }
@@ -28,10 +31,12 @@ After=network.target
 
 [Service]
 WorkingDirectory=$APP_DIR
+EnvironmentFile=-/etc/e2ee-sync.env
 Environment=PORT=$PORT
 Environment=DATA_DIR=$DATA_DIR
 Environment=SERVER_MODE=central
 Environment=REQUIRE_ENCRYPTION=false
+Environment=NODE_OPTIONS=--dns-result-order=ipv4first
 ExecStart=$(command -v node) dist/index.js
 Restart=on-failure
 RestartSec=3
@@ -43,10 +48,21 @@ EOF
 systemctl daemon-reload
 systemctl enable e2ee-sync
 systemctl restart e2ee-sync
-sleep 1
 systemctl is-active e2ee-sync
-curl -fsS "http://127.0.0.1:${PORT}/api/v1/health"
-echo
+ready=0
+for _ in $(seq 1 120); do
+  if curl -fsS "http://127.0.0.1:${PORT}/api/v1/health"; then
+    ready=1
+    echo
+    break
+  fi
+  sleep 5
+done
+if [ "$ready" != 1 ]; then
+  systemctl status e2ee-sync --no-pager || true
+  journalctl -u e2ee-sync -n 60 --no-pager || true
+  exit 1
+fi
 
 SITE="/etc/nginx/sites-available/${DOMAIN}"
 cat > "$SITE" <<EOF

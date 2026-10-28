@@ -10,9 +10,21 @@ test("sqlite is the default and a database url can replace it", () => {
   assert.throws(() => resolveDatabase({ DATABASE_URL: "mongodb://localhost" }, "E:/data"));
 });
 
-test("storage can be local files, the database, or qiniu", () => {
+test("storage can be local files, the database, qiniu, or r2", () => {
   assert.equal(resolveStorage({}).kind, "file");
   assert.equal(resolveStorage({ STORAGE: "database" }).kind, "database");
+  const r2 = resolveStorage({
+    STORAGE: "r2",
+    R2_ENDPOINT: "https://account.r2.cloudflarestorage.com/e2e-sync",
+    R2_API_TOKEN: "token",
+    BLOB_INLINE_MAX_BYTES: "128",
+  });
+  assert.equal(r2.kind, "r2");
+  if (r2.kind !== "r2") return;
+  assert.equal(r2.endpoint, "https://account.r2.cloudflarestorage.com");
+  assert.equal(r2.bucket, "e2e-sync");
+  assert.equal(r2.inlineMaxBytes, 128);
+  assert.equal(r2.apiToken, "token");
   const qiniu = resolveStorage({
     STORAGE: "qiniu",
     QINIU_ACCESS_KEY: "access",

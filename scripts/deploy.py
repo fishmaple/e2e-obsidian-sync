@@ -26,6 +26,16 @@ PORT = int(os.environ.get("DEPLOY_SSH_PORT", "22"))
 USER = os.environ.get("DEPLOY_SSH_USER", "root").strip() or "root"
 SYNC_DOMAIN = os.environ.get("SYNC_DOMAIN", "e2e.fishmaple.cn").strip()
 SYNC_PORT = os.environ.get("SYNC_PORT", "8791").strip()
+APP_ENV_KEYS = (
+    "STORAGE",
+    "BLOB_INLINE_MAX_BYTES",
+    "R2_ENDPOINT",
+    "R2_BUCKET",
+    "R2_API_TOKEN",
+    "R2_ACCESS_KEY_ID",
+    "R2_SECRET_ACCESS_KEY",
+    "DATABASE_URL",
+)
 
 
 def main() -> None:
@@ -53,6 +63,10 @@ def main() -> None:
     client.connect(HOST, port=PORT, username=USER, password=password, timeout=30, allow_agent=False, look_for_keys=False)
     try:
         sftp = client.open_sftp()
+        env_text = app_env_text()
+        if env_text:
+            with sftp.file("/etc/e2ee-sync.env", "w") as remote_env:
+                remote_env.write(env_text)
         sftp.put(str(bundle), "/tmp/e2ee-sync-server.tgz")
         script = (ROOT / "scripts" / "remote-setup.sh").read_bytes().replace(b"\r\n", b"\n")
         with sftp.file("/tmp/e2ee-remote-setup.sh", "w") as remote:
@@ -62,6 +76,20 @@ def main() -> None:
     finally:
         client.close()
         bundle.unlink(missing_ok=True)
+
+
+def app_env_text() -> str:
+    skip = set()
+    if os.environ.get("R2_ACCESS_KEY_ID", "").strip() and os.environ.get("R2_SECRET_ACCESS_KEY", "").strip():
+        skip.add("R2_API_TOKEN")
+    lines = []
+    for key in APP_ENV_KEYS:
+        if key in skip:
+            continue
+        value = os.environ.get(key, "").strip()
+        if value:
+            lines.append(f"{key}={value}")
+    return ("\n".join(lines) + "\n") if lines else ""
 
 
 def run(client: paramiko.SSHClient, command: str) -> None:

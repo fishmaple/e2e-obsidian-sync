@@ -20,12 +20,29 @@ export interface QiniuConfig {
   privateBucket: boolean;
 }
 
+export interface R2Config {
+  endpoint: string;
+  bucket: string;
+  /** Stored objects smaller than this many bytes stay in the SQL database. */
+  inlineMaxBytes: number;
+  accessKeyId: string;
+  secretAccessKey: string;
+  /** Present until startup exchanges it for the S3 key pair. Never written to git. */
+  apiToken: string;
+}
+
 export type DatabaseConfig =
   | { kind: "sqlite"; path: string }
   | { kind: "postgres"; url: string }
   | { kind: "mysql"; url: string };
 
-export type StorageConfig = { kind: "file" } | { kind: "database" } | ({ kind: "qiniu" } & QiniuConfig);
+export type StorageConfig =
+  | { kind: "file" }
+  | { kind: "database" }
+  | ({ kind: "qiniu" } & QiniuConfig)
+  | ({ kind: "r2" } & R2Config);
+
+export const DEFAULT_INLINE_BLOB_BYTES = 128;
 
 export interface AppConfig {
   port: number;
@@ -100,7 +117,8 @@ export function resolveDatabase(env: NodeJS.ProcessEnv, dataDir: string): Databa
 export function resolveStorage(env: NodeJS.ProcessEnv): StorageConfig {
   const kind = (env.STORAGE?.trim() || "file").toLowerCase();
   if (kind === "file" || kind === "database") return { kind };
-  if (kind !== "qiniu") throw new Error("STORAGE must be file, database, or qiniu");
+  if (kind === "r2") return resolveR2(env);
+  if (kind !== "qiniu") throw new Error("STORAGE must be file, database, qiniu, or r2");
   const accessKey = env.QINIU_ACCESS_KEY?.trim() ?? "";
   const secretKey = env.QINIU_SECRET_KEY?.trim() ?? "";
   const bucket = env.QINIU_BUCKET?.trim() ?? "";
@@ -121,6 +139,34 @@ export function resolveStorage(env: NodeJS.ProcessEnv): StorageConfig {
     uploadUrl,
     rsUrl: (env.QINIU_RS_URL?.trim() || "https://rs.qiniu.com").replace(/\/$/, ""),
     privateBucket: env.QINIU_PRIVATE !== "false",
+  };
+}
+
+export function resolveR2(env: NodeJS.ProcessEnv): { kind: "r2" } & R2Config {
+  const raw = env.R2_ENDPOINT?.trim() || env.R2_URL?.trim() || "";
+  if (!raw) throw new Error("R2 storage requires R2_ENDPOINT");
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error("R2_ENDPOINT must be an https URL");
+  }
+  if (url.protocol !== "https:") throw new Error("R2_ENDPOINT must start with https://");
+  const pathBucket = url.pathname.split("/").filter(Boolean)[0] ?? "";
+  const bucket = env.R2_BUCKET?.trim() || pathBucket;
+  if (!bucket) throw new Error("R2 storage requires R2_BUCKET");
+  const inlineRaw = Number(env.BLOB_INLINE_MAX_BYTES ?? DEFAULT_INLINE_BLOB_BYTES);
+  if (!Number.isSafeInteger(inlineRaw) || inlineRaw < 1 || inlineRaw > 1024 * 1024) {
+    throw new Error("BLOB_INLINE_MAX_BYTES must be an integer from 1 to 1048576");
+  }
+  return {
+    kind: "r2",
+    endpoint: url.origin,
+    bucket,
+    inlineMaxBytes: inlineRaw,
+    accessKeyId: env.R2_ACCESS_KEY_ID?.trim() ?? "",
+    secretAccessKey: env.R2_SECRET_ACCESS_KEY?.trim() ?? "",
+    apiToken: env.R2_API_TOKEN?.trim() ?? "",
   };
 }
 

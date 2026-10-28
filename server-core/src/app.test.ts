@@ -398,8 +398,8 @@ test("the home page links to install, and a remote vault can be marked encrypted
     assert.doesNotMatch(sh, /urlretrieve/);
     const latest = await app.request("http://127.0.0.1/plugin/e2ee-sync/latest");
     assert.equal(latest.status, 200);
-    assert.equal((await latest.text()).trim(), "0.3.1-beta");
-    const sums = await app.request("http://127.0.0.1/plugin/e2ee-sync/0.3.1-beta/SHA256SUMS");
+    assert.equal((await latest.text()).trim(), "0.3.2-beta-keepboth-md");
+    const sums = await app.request("http://127.0.0.1/plugin/e2ee-sync/0.3.2-beta-keepboth-md/SHA256SUMS");
     assert.equal(sums.status, 200);
     assert.match(await sums.text(), /[0-9a-f]{64}  main\.js/);
     const account = await app.request("http://127.0.0.1/install");
@@ -516,6 +516,68 @@ test("object revisions reject a stale parent and changes are incremental", async
     const goneBody = await gone.json() as ConflictBody;
     assert.equal(goneBody.reason, "deleted");
     assert.equal(goneBody.file, null);
+  } finally {
+    await db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("signed url list uploads and downloads without proxying the body twice", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "e2ee-urls-"));
+  const config = testConfig(dir, { requireEncryption: false });
+  const db = await openDatabase(config);
+  const app = createApp({ config, db });
+  try {
+    const token = await devToken(app);
+    const fileId = "ab".repeat(32);
+    const contentCipher = { v: 0 as const, raw: bytesToBase64(new TextEncoder().encode("hello")) };
+    const content = JSON.stringify(contentCipher);
+    const bytes = Buffer.byteLength(content);
+    const meta = {
+      vault: "diary",
+      pathCipher: { v: 0 as const, raw: bytesToBase64(new TextEncoder().encode("a.md")) },
+      contentMac: "cd".repeat(32),
+      size: 5,
+      mtime: 1700000000000,
+      encoding: "plain" as const,
+      parentRev: null,
+      blobBytes: bytes,
+    };
+    const issued = await authed(app, token, "POST", "/api/v1/urls", {
+      vault: "diary",
+      uploads: [{ fileId, parentRev: null, bytes }],
+    });
+    assert.equal(issued.status, 200, await issued.clone().text());
+    const listed = await issued.json() as { uploads: { url: string }[]; conflicts: unknown[] };
+    assert.equal(listed.conflicts.length, 0);
+    assert.equal(listed.uploads.length, 1);
+    const uploadUrl = listed.uploads[0]?.url ?? "";
+    assert.match(uploadUrl, /\/api\/v1\/direct\//);
+    const put = await app.request(uploadUrl, { method: "PUT", body: content });
+    assert.equal(put.status, 204, await put.text());
+    const committed = await authed(app, token, "POST", `/api/v1/objects/${fileId}/commit`, meta);
+    assert.equal(committed.status, 200, await committed.text());
+
+    const conflicted = await authed(app, token, "POST", "/api/v1/urls", {
+      vault: "diary",
+      uploads: [{ fileId, parentRev: null, bytes }],
+    });
+    const conflictBody = await conflicted.json() as { uploads: unknown[]; conflicts: { reason: string }[] };
+    assert.equal(conflictBody.uploads.length, 0);
+    assert.equal(conflictBody.conflicts[0]?.reason, "parent_rev");
+
+    const downloads = await authed(app, token, "POST", "/api/v1/urls", { vault: "diary", downloads: [fileId] });
+    assert.equal(downloads.status, 200, await downloads.clone().text());
+    const saved = await downloads.json() as { downloads: { url: string; contentMac: string }[]; missing: string[] };
+    assert.deepEqual(saved.missing, []);
+    const body = await app.request(saved.downloads[0]?.url ?? "");
+    assert.equal(body.status, 200);
+    assert.equal(await body.text(), content);
+    const legacy = await authed(app, token, "GET", `/api/v1/objects/${fileId}`);
+    assert.equal(legacy.status, 200);
+    assert.equal(JSON.stringify((await legacy.json() as { contentCipher: unknown }).contentCipher), content);
+    const forged = await app.request(`http://127.0.0.1/api/v1/direct/${"0".repeat(8)}-0000-0000-0000-000000000000/${fileId}?exp=${Date.now() + 1000}&sig=${"0".repeat(64)}`);
+    assert.equal(forged.status, 401);
   } finally {
     await db.close();
     rmSync(dir, { recursive: true, force: true });

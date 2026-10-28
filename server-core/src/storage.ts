@@ -3,6 +3,7 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { AppConfig, QiniuConfig } from "./config";
 import type { SyncDb } from "./db";
+import { R2Client, resolveR2Credentials } from "./r2";
 
 export interface BlobStore {
   put(accountId: string, fileId: string, json: string): Promise<void>;
@@ -10,10 +11,65 @@ export interface BlobStore {
   delete(accountId: string, fileId: string): Promise<void>;
 }
 
+export async function prepareStorage(config: AppConfig): Promise<AppConfig> {
+  if (config.storage.kind !== "r2") return config;
+  const credentials = await resolveR2Credentials(config.storage);
+  return {
+    ...config,
+    storage: { ...config.storage, ...credentials, apiToken: "" },
+  };
+}
+
 export function createBlobStore(config: AppConfig, db: SyncDb): BlobStore {
   if (config.storage.kind === "file") return new FileBlobStore(config.dataDir);
   if (config.storage.kind === "database") return new DatabaseBlobStore(db);
-  return new QiniuBlobStore(config.storage);
+  if (config.storage.kind === "qiniu") return new QiniuBlobStore(config.storage);
+  if (!config.storage.accessKeyId || !config.storage.secretAccessKey) {
+    throw new Error("R2 credentials are not ready");
+  }
+  return new HybridBlobStore(
+    db,
+    new R2Client(config.storage.endpoint, config.storage.bucket, config.storage),
+    config.storage.inlineMaxBytes,
+  );
+}
+
+export class HybridBlobStore implements BlobStore {
+  constructor(
+    private readonly db: SyncDb,
+    private readonly remote: BlobStore,
+    private readonly inlineMaxBytes: number,
+  ) {}
+
+  async put(accountId: string, fileId: string, json: string): Promise<void> {
+    if (storedBytes(json) < this.inlineMaxBytes) {
+      await this.db.putBlob(accountId, fileId, json);
+      await this.remote.delete(accountId, fileId);
+      return;
+    }
+    await this.remote.put(accountId, fileId, json);
+    await this.db.deleteBlob(accountId, fileId);
+  }
+
+  async get(accountId: string, fileId: string): Promise<string> {
+    const inline = await this.db.getBlob(accountId, fileId);
+    if (inline !== undefined && storedBytes(inline) < this.inlineMaxBytes) return inline;
+    try {
+      return await this.remote.get(accountId, fileId);
+    } catch (error) {
+      if (inline !== undefined) return inline;
+      throw error;
+    }
+  }
+
+  async delete(accountId: string, fileId: string): Promise<void> {
+    await this.db.deleteBlob(accountId, fileId);
+    await this.remote.delete(accountId, fileId);
+  }
+}
+
+export function storedBytes(json: string): number {
+  return Buffer.byteLength(json, "utf8");
 }
 
 class FileBlobStore implements BlobStore {

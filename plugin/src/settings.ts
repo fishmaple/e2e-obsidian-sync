@@ -6,6 +6,7 @@ import { t } from "./i18n";
 import { canSealSecrets } from "./local-secret";
 import { sharedConfigProblem } from "./shared-config";
 import { promptBind } from "./bind-prompt";
+import { clampTransferParallel } from "./sync";
 import { hasActiveBinding } from "./binding";
 import { FILE_GROUPS, isKnownSuffix, normalizeSuffix } from "./file-kinds";
 import type E2eeSyncPlugin from "./main";
@@ -236,6 +237,30 @@ export class E2eeSettingTab extends PluginSettingTab {
     this.plugin.onSyncMeta = () => {
       autoSync.setDesc(autoSyncText(this.plugin));
     };
+
+    new Setting(containerEl)
+      .setName(t("transferParallel"))
+      .setDesc(t("transferParallelDesc"))
+      .addText((text) => {
+        text.setPlaceholder("10")
+          .setValue(String(this.plugin.settings.transferParallel));
+        const apply = async (value: string, snap: boolean) => {
+          const raw = Number(value.trim());
+          if (!Number.isFinite(raw) || !Number.isInteger(raw)) return;
+          if (!snap && (raw < 1 || raw > 20)) return;
+          const slots = clampTransferParallel(raw);
+          if (snap && String(slots) !== value.trim()) {
+            text.setValue(String(slots));
+            if (raw > 20) new Notice(t("transferParallelMax", { n: slots }));
+            else if (raw < 1) new Notice(t("transferParallelMin", { n: slots }));
+          }
+          if (slots === this.plugin.settings.transferParallel) return;
+          this.plugin.settings.transferParallel = slots;
+          await this.plugin.saveSettings();
+        };
+        text.onChange((value) => { void apply(value, false); });
+        text.inputEl.addEventListener("change", () => { void apply(text.getValue(), true); });
+      });
 
     new Setting(containerEl)
       .setName(t("actions"))
