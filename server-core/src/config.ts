@@ -55,6 +55,8 @@ export interface AppConfig {
   accessToken: string;
   database: DatabaseConfig;
   storage: StorageConfig;
+  sessionTtlMs: number;
+  adminKey: string;
 }
 
 const QINIU_UPLOAD: Record<string, string> = {
@@ -79,9 +81,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     ? { issuer, clientId, clientSecret, redirectUri }
     : null;
   const mode = env.SERVER_MODE?.trim() === "single" ? "single" : "central";
-  const allowDevLogin = mode === "central" && (env.ALLOW_DEV_LOGIN
-    ? env.ALLOW_DEV_LOGIN === "true"
-    : !oidc);
+  const allowDevLogin = mode === "central" && env.ALLOW_DEV_LOGIN === "true";
+  const ttlHours = Number(env.SESSION_TTL_HOURS ?? "720");
+  const sessionTtlMs = Number.isFinite(ttlHours) && ttlHours > 0
+    ? Math.min(ttlHours, 24 * 365) * 60 * 60 * 1000
+    : 720 * 60 * 60 * 1000;
   const requireEncryption = env.REQUIRE_ENCRYPTION
     ? env.REQUIRE_ENCRYPTION === "true"
     : mode === "central";
@@ -96,6 +100,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     accessToken: env.ACCESS_TOKEN?.trim() ?? "",
     database: resolveDatabase(env, dataDir),
     storage: resolveStorage(env),
+    sessionTtlMs,
+    adminKey: env.ADMIN_KEY?.trim() ?? "",
   };
 }
 

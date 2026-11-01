@@ -8,12 +8,18 @@ import { sharedConfigProblem } from "./shared-config";
 import { promptBind } from "./bind-prompt";
 import { clampTransferParallel } from "./sync";
 import { hasActiveBinding } from "./binding";
+import { TrashModal } from "./trash";
+import { clampMaxFileBytes, clampNonNegative, clampTrashDays } from "./limits";
 import { FILE_GROUPS, isKnownSuffix, normalizeSuffix } from "./file-kinds";
 import type E2eeSyncPlugin from "./main";
 
 export class E2eeSettingTab extends PluginSettingTab {
   private keyInput: HTMLInputElement | null = null;
   private statusEl: HTMLElement | null = null;
+  private loginId = "";
+  private loginPassword = "";
+  private currentPassword = "";
+  private nextPassword = "";
 
   constructor(private readonly plugin: E2eeSyncPlugin) {
     super(plugin.app, plugin);
@@ -65,6 +71,13 @@ export class E2eeSettingTab extends PluginSettingTab {
     account.descEl.addClass("e2ee-sync-account");
     if (!loggedIn) {
       account.setDesc(t("notLoggedIn"));
+      new Setting(containerEl).setName(t("loginId")).addText((text) => {
+        text.setValue(this.loginId).onChange((value) => { this.loginId = value.trim(); });
+      });
+      new Setting(containerEl).setName(t("loginPassword")).addText((text) => {
+        text.inputEl.type = "password";
+        text.setValue(this.loginPassword).onChange((value) => { this.loginPassword = value; });
+      });
       account.addButton((button) => {
         button.setButtonText(t("login")).setCta().onClick(() => {
           void this.login();
@@ -73,12 +86,20 @@ export class E2eeSettingTab extends PluginSettingTab {
       containerEl.createEl("p", { text: t("loginDesc"), cls: "e2ee-sync-status-line" });
     } else {
       account.setDesc("");
-      account.descEl.createDiv({ text: t("accountNameLine", { name: this.plugin.settings.displayName || t("none") }) });
-      account.descEl.createDiv({ text: t("accountIdLine", { id: this.plugin.settings.accountId }) });
+      account.descEl.createDiv({ text: t("accountNameLine", { name: this.plugin.settings.displayName || this.plugin.settings.accountId }) });
       account.addButton((button) => {
         button.setButtonText(t("logout")).onClick(() => {
           this.confirmLogout();
         });
+      });
+      new Setting(containerEl).setName(t("changePassword")).addText((text) => {
+        text.inputEl.type = "password";
+        text.setPlaceholder(t("currentPassword")).onChange((value) => { this.currentPassword = value; });
+      }).addText((text) => {
+        text.inputEl.type = "password";
+        text.setPlaceholder(t("nextPassword")).onChange((value) => { this.nextPassword = value; });
+      }).addButton((button) => {
+        button.setButtonText(t("changePassword")).onClick(() => { void this.changePassword(); });
       });
       void this.refreshProfile();
     }
@@ -263,6 +284,62 @@ export class E2eeSettingTab extends PluginSettingTab {
       });
 
     new Setting(containerEl)
+      .setName(t("conflictPolicy"))
+      .setDesc(t("conflictPolicyDesc"))
+      .addDropdown((drop) => {
+        drop.addOption("snapshot", t("conflictSnapshot"));
+        drop.addOption("ask", t("conflictAsk"));
+        drop.addOption("overwrite", t("conflictOverwrite"));
+        drop.setValue(this.plugin.settings.conflictPolicy || "snapshot");
+        drop.onChange(async (value) => {
+          if (value !== "ask" && value !== "snapshot" && value !== "overwrite") return;
+          this.plugin.settings.conflictPolicy = value;
+          await this.plugin.saveSettings();
+        });
+      });
+    new Setting(containerEl)
+      .setName(t("maxFile"))
+      .setDesc(t("maxFileDesc"))
+      .addText((text) => {
+        text.setValue(String(Math.round(this.plugin.settings.maxFileBytes / (1024 * 1024))));
+        text.inputEl.addEventListener("change", () => {
+          const mb = Number(text.getValue());
+          this.plugin.settings.maxFileBytes = clampMaxFileBytes(Number.isFinite(mb) ? mb * 1024 * 1024 : this.plugin.settings.maxFileBytes);
+          text.setValue(String(Math.round(this.plugin.settings.maxFileBytes / (1024 * 1024))));
+          void this.plugin.saveSettings();
+        });
+      });
+    new Setting(containerEl)
+      .setName(t("excludePatterns"))
+      .setDesc(t("excludePatternsDesc"))
+      .addTextArea((text) => {
+        text.setValue((this.plugin.settings.excludePatterns ?? []).join("\n"));
+        text.onChange(async (value) => {
+          this.plugin.settings.excludePatterns = value.split(/\r?\n/).map((item) => item.trim()).filter(Boolean).slice(0, 200);
+          await this.plugin.saveSettings();
+        });
+      });
+    this.numberSetting(containerEl, t("vaultMaxFiles"), t("vaultMaxFilesDesc"), this.plugin.settings.vaultMaxFiles, async (value) => {
+      this.plugin.settings.vaultMaxFiles = clampNonNegative(value, 0, 1_000_000);
+      await this.plugin.saveSettings();
+    });
+    this.numberSetting(containerEl, t("vaultMaxBytes"), t("vaultMaxBytesDesc"), Math.round(this.plugin.settings.vaultMaxBytes / (1024 * 1024)), async (value) => {
+      this.plugin.settings.vaultMaxBytes = clampNonNegative(Number(value) * 1024 * 1024, 0, 1024 * 1024 * 1024 * 1024);
+      await this.plugin.saveSettings();
+    });
+    this.numberSetting(containerEl, t("trashDays"), "", this.plugin.settings.trashDays, async (value) => {
+      this.plugin.settings.trashDays = clampTrashDays(value);
+      await this.plugin.saveSettings();
+    });
+    this.numberSetting(containerEl, t("trashFiles"), "", this.plugin.settings.trashMaxFiles, async (value) => {
+      this.plugin.settings.trashMaxFiles = clampNonNegative(value, 200, 100_000);
+      await this.plugin.saveSettings();
+    });
+    new Setting(containerEl).setName(t("trashTitle")).addButton((button) => {
+      button.setButtonText(t("trashOpen")).onClick(() => { new TrashModal(this.app, this.plugin).open(); });
+    });
+
+    new Setting(containerEl)
       .setName(t("actions"))
       .addButton((button) => button.setButtonText(t("test")).onClick(() => { void this.testConnection(); }))
       .addButton((button) => button.setButtonText(t("syncNow")).setCta().onClick(() => { void this.plugin.syncNow(true); }))
@@ -362,6 +439,37 @@ export class E2eeSettingTab extends PluginSettingTab {
     }
   }
 
+  private numberSetting(
+    containerEl: HTMLElement,
+    name: string,
+    desc: string,
+    value: number,
+    save: (value: number) => Promise<void>,
+  ): void {
+    new Setting(containerEl).setName(name).setDesc(desc).addText((text) => {
+      text.setValue(String(value));
+      text.inputEl.addEventListener("change", () => {
+        const parsed = Number(text.getValue());
+        void save(Number.isFinite(parsed) ? parsed : value).then(() => {
+          text.setValue(text.getValue());
+        });
+      });
+    });
+  }
+
+  private async changePassword(): Promise<void> {
+    try {
+      const client = new SyncClient(resolveSyncHost(this.plugin.settings.host), this.plugin.settings.apiToken);
+      await client.changePassword(this.currentPassword, this.nextPassword);
+      this.currentPassword = "";
+      this.nextPassword = "";
+      new Notice(t("passwordChanged"));
+      this.display();
+    } catch (error) {
+      new Notice(error instanceof Error ? error.message : t("syncFailed"));
+    }
+  }
+
   private async login(): Promise<void> {
     try {
       const host = resolveSyncHost(this.plugin.settings.host);
@@ -376,15 +484,19 @@ export class E2eeSettingTab extends PluginSettingTab {
         if (!hasActiveBinding(this.plugin.settings)) promptBind(this.plugin);
         return;
       }
-      const state = bytesToBase64Url(randomBytes(32));
-      const vault = this.plugin.app.vault.getName();
-      this.plugin.armLogin(host, state);
-      const url = new URL("/login", host);
-      url.searchParams.set("return", "obsidian");
-      url.searchParams.set("state", state);
-      url.searchParams.set("vault", vault);
-      openExternal(url.toString());
-      new Notice(t("loginBrowser"));
+      if (!this.loginId || !this.loginPassword) {
+        new Notice(t("loginNeedPassword"));
+        return;
+      }
+      const session = await new SyncClient(host, "").loginPassword(this.loginId, this.loginPassword);
+      this.plugin.setLogin(session.accountId, session.apiToken, session.displayName || this.loginId);
+      this.loginPassword = "";
+      await this.plugin.saveSettings();
+      await this.plugin.refreshBoundIdentity();
+      await this.plugin.alignEncryptionWithRemote();
+      new Notice(t("loggedIn"));
+      this.display();
+      if (!hasActiveBinding(this.plugin.settings)) promptBind(this.plugin);
     } catch (error) {
       new Notice(error instanceof Error ? error.message : t("loginFailed"));
     }

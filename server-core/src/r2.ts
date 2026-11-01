@@ -85,7 +85,7 @@ export class R2Client {
     });
   }
 
-  presignUpload(accountId: string, fileId: string, expiresSeconds: number): string {
+  presignUpload(accountId: string, fileId: string, expiresSeconds: number, checksumSha256?: string): string {
     return presignR2Url({
       method: "PUT",
       endpoint: this.endpoint,
@@ -94,6 +94,7 @@ export class R2Client {
       accessKeyId: this.credentials.accessKeyId,
       secretAccessKey: this.credentials.secretAccessKey,
       expiresSeconds,
+      checksumSha256,
     });
   }
 
@@ -239,6 +240,8 @@ export function signR2Request(input: {
   return { url, headers };
 }
 
+export const SIGN_R2_CHECKSUM = true;
+
 export function presignR2Url(input: {
   method: "GET" | "PUT" | "DELETE";
   endpoint: string;
@@ -248,18 +251,24 @@ export function presignR2Url(input: {
   secretAccessKey: string;
   expiresSeconds: number;
   now?: Date;
+  checksumSha256?: string;
 }): string {
   const now = input.now ?? new Date();
   const amzDate = now.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
   const dateStamp = amzDate.slice(0, 8);
   const host = new URL(input.endpoint).host;
   const scope = `${dateStamp}/auto/s3/aws4_request`;
+  const checksum = input.checksumSha256?.trim() ?? "";
+  const signedHeaders = checksum ? "host;x-amz-checksum-sha256" : "host";
+  const canonicalHeaders = checksum
+    ? `host:${host}\nx-amz-checksum-sha256:${checksum}\n`
+    : `host:${host}\n`;
   const query = {
     "X-Amz-Algorithm": "AWS4-HMAC-SHA256",
     "X-Amz-Credential": `${input.accessKeyId}/${scope}`,
     "X-Amz-Date": amzDate,
     "X-Amz-Expires": String(input.expiresSeconds),
-    "X-Amz-SignedHeaders": "host",
+    "X-Amz-SignedHeaders": signedHeaders,
   };
   const canonicalUri = objectUri(input.bucket, input.key);
   const canonicalQuery = canonicalQueryString(query);
@@ -267,8 +276,8 @@ export function presignR2Url(input: {
     input.method,
     canonicalUri,
     canonicalQuery,
-    `host:${host}\n`,
-    "host",
+    canonicalHeaders,
+    signedHeaders,
     "UNSIGNED-PAYLOAD",
   ].join("\n");
   const stringToSign = `AWS4-HMAC-SHA256\n${amzDate}\n${scope}\n${sha256(canonicalRequest)}`;

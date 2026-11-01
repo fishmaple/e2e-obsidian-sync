@@ -1,10 +1,12 @@
 import { FileSystemAdapter, Modal, Notice, TFile, type App, type Vault } from "obsidian";
 import { bytesToBase64, randomBytes } from "../../shared/src/codec";
 import { contentMac, deriveKeys, fileIdForPath, openBytes, plainFileId, plainMac, sealBytes } from "../../shared/src/crypto";
-import { MAX_FILE_BYTES, MIN_SECRET_LENGTH, remoteRev, type ChangeEntry, type Encoding, type PutResult, type RemoteFile, type VaultStat } from "../../shared/src/protocol";
+import { MIN_SECRET_LENGTH, remoteRev, type ChangeEntry, type Encoding, type PutResult, type RemoteFile, type VaultStat } from "../../shared/src/protocol";
 import { decideSyncAction } from "../../shared/src/reconcile";
 import { SyncClient, SyncConflictError, fetchBootstrap, openExternal, resolveSyncHost } from "./client";
 import { askConflict, type ConflictChoice, type ConflictView } from "./conflict";
+import { excludedPath } from "./exclude";
+import { clampMaxFileBytes } from "./limits";
 import { suffixSelected } from "./file-kinds";
 import { t } from "./i18n";
 import { isDesktopApp, obsidianConfigDir, warnMissingObsidianConfig } from "./obsidian-dir";
@@ -71,6 +73,13 @@ export function propagatePlugin(plugin: E2eeSyncPlugin): string[] {
 
 export async function pushVault(plugin: E2eeSyncPlugin): Promise<string> {
   const ready = await openClient(plugin);
+  await ready.client.putPolicy({
+    trashDays: plugin.settings.trashDays,
+    trashMaxFiles: plugin.settings.trashMaxFiles,
+    vaultId: ready.vaultId,
+    maxFiles: plugin.settings.vaultMaxFiles,
+    maxBytes: plugin.settings.vaultMaxBytes,
+  });
   const encoding: Encoding = plugin.settings.encryptNotes ? "e2ee" : "plain";
   if (encoding === "plain") {
     const boot = await fetchBootstrap(ready.host, plugin.settings.accessToken);
@@ -96,9 +105,9 @@ export async function pushVault(plugin: E2eeSyncPlugin): Promise<string> {
   const counts = () => uploaded + downloaded + unchanged + removed;
 
   for (const file of files) {
-    const fileId = ready.keys
+    const fileId = indexedFileId(index, file.path) ?? (ready.keys
       ? await fileIdForPath(ready.keys.idKey, file.path, ready.vaultName)
-      : await plainFileId(ready.vaultName, file.path);
+      : await plainFileId(ready.vaultName, file.path));
     seen.add(fileId);
     const cached = index[fileId];
     const remoteFile = remote.get(fileId) ?? null;
@@ -109,7 +118,8 @@ export async function pushVault(plugin: E2eeSyncPlugin): Promise<string> {
       remote: remoteSide(remoteFile),
       base: baseOf(cached),
     });
-    if (action.type === "unchanged") {
+    const pathDirty = cached?.path === file.path && cached.pathDirty === true;
+    if (action.type === "unchanged" && !pathDirty) {
       index[fileId] = syncedEntry(file.path, file.stat.mtime, file.stat.size, mac, encoding, remoteRev(remoteFile ?? {}) || cached?.rev);
       unchanged++;
       continue;
@@ -123,16 +133,15 @@ export async function pushVault(plugin: E2eeSyncPlugin): Promise<string> {
     }
     if (action.type === "download") {
       if (!remoteFile) continue;
-      if (remoteFile.size > MAX_FILE_BYTES) {
+      if (remoteFile.size > fileLimit(plugin)) {
         skippedLarge.push(file.path);
-        deferCursor = true;
         continue;
       }
       downloads.push({ file: remoteFile, countMiss: true });
       continue;
     }
-    if (action.type === "upload") {
-      if (plain.byteLength > MAX_FILE_BYTES) {
+    if (action.type === "upload" || (action.type === "unchanged" && pathDirty)) {
+      if (plain.byteLength > fileLimit(plugin)) {
         skippedLarge.push(file.path);
         continue;
       }
@@ -144,16 +153,16 @@ export async function pushVault(plugin: E2eeSyncPlugin): Promise<string> {
         encoding,
         mtime: file.stat.mtime,
         size: file.stat.size,
-        parentRev: action.parentRev,
+        parentRev: action.type === "upload" ? action.parentRev : (remoteRev(remoteFile ?? {}) || cached?.rev || null),
         base: cached ?? null,
         remote: remoteFile,
+        renamed: pathDirty,
       });
       continue;
     }
     if (action.type === "conflict") {
-      if (plain.byteLength > MAX_FILE_BYTES || (remoteFile && remoteFile.size > MAX_FILE_BYTES)) {
+      if (plain.byteLength > fileLimit(plugin) || (remoteFile && remoteFile.size > fileLimit(plugin))) {
         skippedLarge.push(file.path);
-        deferCursor = true;
         continue;
       }
       conflictJobs.push({
@@ -189,9 +198,8 @@ export async function pushVault(plugin: E2eeSyncPlugin): Promise<string> {
     }
     if (action.type === "download" && remoteFile) {
       seen.add(fileId);
-      if (remoteFile.size > MAX_FILE_BYTES) {
+      if (remoteFile.size > fileLimit(plugin)) {
         skippedLarge.push(cached.path);
-        deferCursor = true;
         continue;
       }
       downloads.push({ file: remoteFile, countMiss: true });
@@ -199,9 +207,8 @@ export async function pushVault(plugin: E2eeSyncPlugin): Promise<string> {
     }
     if (action.type === "conflict") {
       seen.add(fileId);
-      if (remoteFile && remoteFile.size > MAX_FILE_BYTES) {
+      if (remoteFile && remoteFile.size > fileLimit(plugin)) {
         skippedLarge.push(cached.path);
-        deferCursor = true;
         continue;
       }
       conflictJobs.push({
@@ -224,9 +231,8 @@ export async function pushVault(plugin: E2eeSyncPlugin): Promise<string> {
 
   for (const remoteFile of remote.values()) {
     if (seen.has(remoteFile.fileId)) continue;
-    if (remoteFile.size > MAX_FILE_BYTES) {
+    if (remoteFile.size > fileLimit(plugin)) {
       skippedLarge.push(remoteFile.fileId);
-      deferCursor = true;
       continue;
     }
     downloads.push({ file: remoteFile, countMiss: false });
@@ -272,7 +278,8 @@ export async function pushVault(plugin: E2eeSyncPlugin): Promise<string> {
     const item = conflicts[i];
     if (!item) continue;
     plugin.setStatus(t("conflictTitle", { index: i + 1, total: conflicts.length }));
-    const choice = await askConflict(plugin.app, conflictView(item, i + 1, conflicts.length));
+    const policy = plugin.settings.conflictPolicy || "snapshot";
+    const choice = policy === "ask" ? await askConflict(plugin.app, conflictView(item, i + 1, conflicts.length)) : (autoChoice(policy, item) ?? await askConflict(plugin.app, conflictView(item, i + 1, conflicts.length)));
     const outcome = await applyConflict(plugin, ready, index, item, choice, device, encoding);
     if (outcome === "resolved") {
       resolved++;
@@ -434,6 +441,7 @@ async function putFile(
   encoding: Encoding,
   mtime: number,
   parentRev: number | null,
+  renamed = false,
 ): Promise<PutResult> {
   return ready.client.putObject(fileId, {
     vault: ready.vaultName,
@@ -441,6 +449,8 @@ async function putFile(
     pathCipher: ready.keys
       ? await sealBytes(ready.keys.encKey, new TextEncoder().encode(path), `path:${fileId}`, true)
       : { v: 0, raw: bytesToBase64(new TextEncoder().encode(path)) },
+    pathMac: await fingerprint(ready, new TextEncoder().encode(path)),
+    renamed,
     contentCipher: ready.keys
       ? await sealBytes(ready.keys.encKey, plain, `body:${fileId}`, true)
       : { v: 0, raw: bytesToBase64(plain) },
@@ -467,10 +477,11 @@ async function uploadTracked(
     parentRev: number | null;
     base: FileIndexEntry | null;
     remote: RemoteFile | null;
+    renamed?: boolean;
   },
 ): Promise<"uploaded" | PendingConflict> {
   try {
-    const result = await putFile(ready, input.fileId, input.path, input.plain, input.mac, input.encoding, input.mtime, input.parentRev);
+    const result = await putFile(ready, input.fileId, input.path, input.plain, input.mac, input.encoding, input.mtime, input.parentRev, input.renamed === true);
     index[input.fileId] = syncedEntry(input.path, input.mtime, input.size, input.mac, input.encoding, result.rev || input.remote?.rev);
     return "uploaded";
   } catch (error) {
@@ -657,7 +668,7 @@ async function applyConflict(
   }
   if (choice.action === "merge") {
     const bytes = new TextEncoder().encode(choice.text);
-    if (bytes.byteLength > MAX_FILE_BYTES) return "unresolved";
+    if (bytes.byteLength > fileLimit(plugin)) return "unresolved";
     await writeVaultFile(plugin.app.vault, item.path, bytes);
     const mac = await fingerprint(ready, bytes);
     const stat = fileStat(plugin, item.path, Date.now(), bytes.byteLength);
@@ -685,7 +696,7 @@ async function uploadCurrent(
   const file = plugin.app.vault.getAbstractFileByPath(item.path);
   if (!(file instanceof TFile)) return "unresolved";
   const plain = new Uint8Array(await plugin.app.vault.readBinary(file));
-  if (plain.byteLength > MAX_FILE_BYTES) return "unresolved";
+  if (plain.byteLength > fileLimit(plugin)) return "unresolved";
   const mac = await fingerprint(ready, plain);
   try {
     const result = await putFile(ready, item.fileId, item.path, plain, mac, encoding, file.stat.mtime, parentRev);
@@ -765,7 +776,7 @@ async function pullRemote(
   index: E2eeSyncPlugin["settings"]["index"],
   enqueue: <T>(fn: () => Promise<T>) => Promise<T>,
 ): Promise<boolean> {
-  if (remoteFile.size > MAX_FILE_BYTES) return false;
+  if (remoteFile.size > fileLimit(plugin)) return false;
   const known = index[remoteFile.fileId]?.path;
   if (known && !shouldSync(plugin, known)) return false;
   const stored = await ready.client.getObject(remoteFile.fileId, ready.vaultId);
@@ -775,6 +786,11 @@ async function pullRemote(
   if (!shouldSync(plugin, path)) return false;
   const data = await openBytes(ready.keys?.encKey ?? null, stored.contentCipher, `body:${remoteFile.fileId}`);
   await enqueue(async () => {
+    const currentPath = known && known !== path ? known : "";
+    const current = currentPath ? plugin.app.vault.getAbstractFileByPath(currentPath) : null;
+    if (current instanceof TFile && !plugin.app.vault.getAbstractFileByPath(path)) {
+      await plugin.app.vault.rename(current, path);
+    }
     await writeVaultFile(plugin.app.vault, path, data);
     stampMtime(plugin, path, remoteFile.mtime);
     const rev = remoteRev(remoteFile);
@@ -795,7 +811,33 @@ function shouldSync(plugin: E2eeSyncPlugin, path: string): boolean {
   const normalized = path.replaceAll("\\", "/");
   if (PLUGIN_FILES.has(normalized)) return true;
   if (!isSyncablePath(normalized)) return false;
+  if (excludedPath(normalized, plugin.settings.excludePatterns ?? [])) return false;
   return suffixSelected(normalized, plugin.settings.syncSuffixes, plugin.settings.syncOther, plugin.settings.customSuffixes);
+}
+
+function fileLimit(plugin: E2eeSyncPlugin): number {
+  return clampMaxFileBytes(plugin.settings.maxFileBytes);
+}
+
+function indexedFileId(index: Record<string, FileIndexEntry>, path: string): string | undefined {
+  for (const [id, entry] of Object.entries(index)) {
+    if (entry.path === path) return id;
+  }
+  return undefined;
+}
+
+function autoChoice(policy: string, item: PendingConflict): ConflictChoice | null {
+  if (policy === "overwrite") {
+    if (item.kind === "remote-deleted") return { action: "remote" };
+    if (item.remoteBytes) return { action: "remote" };
+    return null;
+  }
+  if (policy === "snapshot") {
+    if (item.kind === "remote-deleted" && item.localBytes) return { action: "local" };
+    if (item.kind === "local-deleted" && item.remoteBytes) return { action: "remote" };
+    if (item.localBytes && item.remoteBytes) return { action: "both" };
+  }
+  return null;
 }
 
 export async function restoreVault(

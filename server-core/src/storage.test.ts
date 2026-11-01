@@ -43,6 +43,8 @@ function config(dir: string, storage: AppConfig["storage"]): AppConfig {
     accessToken: "",
     database: { kind: "sqlite", path: join(dir, "sync.db") },
     storage,
+    sessionTtlMs: 30 * 24 * 60 * 60 * 1000,
+    adminKey: "test-admin",
   };
 }
 

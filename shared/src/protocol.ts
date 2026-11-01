@@ -3,8 +3,8 @@ export const PUBLIC_SERVER_HOST = "https://e2e.fishmaple.cn";
 
 export const PROTOCOL_VERSION = 1;
 export const MIN_SECRET_LENGTH = 16;
-export const MAX_FILE_BYTES = 32 * 1024 * 1024;
-export const MAX_BODY_BYTES = 48 * 1024 * 1024;
+export const MAX_FILE_BYTES = 256 * 1024 * 1024;
+export const MAX_BODY_BYTES = 320 * 1024 * 1024;
 export const MAX_CLOCK_SKEW_MS = 5 * 60 * 1000;
 export const DEVICE_TTL_MS = 5 * 60 * 1000;
 export const PAIRING_TTL_MS = 10 * 60 * 1000;
@@ -63,6 +63,10 @@ export interface ObjectPayload {
    * JSON may use `parentRev` (canonical, same style as contentMac) or `parent_rev`.
    */
   parentRev?: number | null;
+  /** Stable fingerprint of the path. Same path keeps the same value across uploads. */
+  pathMac?: string;
+  /** True when this upload is a rename of an existing file id. */
+  renamed?: boolean;
 }
 
 export interface PutResult {
@@ -106,6 +110,7 @@ export interface SignedTransfer {
   fileId: string;
   url: string;
   expiresAt: number;
+  headers?: Record<string, string>;
 }
 
 export interface DownloadUrl extends SignedTransfer {
@@ -116,6 +121,7 @@ export interface DownloadUrl extends SignedTransfer {
   updatedAt: number;
   encoding: Encoding;
   rev: number;
+  sha256?: string;
 }
 
 export interface UrlConflict {
