@@ -6,6 +6,8 @@ import { t } from "./i18n";
 import { canSealSecrets } from "./local-secret";
 import { sharedConfigProblem } from "./shared-config";
 import { promptBind } from "./bind-prompt";
+import { wipePlaintextHistory } from "./history";
+import { clampAutoVersionLimit } from "../../shared/src/history";
 import { clampTransferParallel } from "./sync";
 import { hasActiveBinding } from "./binding";
 import { FILE_GROUPS, isKnownSuffix, normalizeSuffix } from "./file-kinds";
@@ -261,6 +263,49 @@ export class E2eeSettingTab extends PluginSettingTab {
         text.onChange((value) => { void apply(value, false); });
         text.inputEl.addEventListener("change", () => { void apply(text.getValue(), true); });
       });
+
+    new Setting(containerEl)
+      .setName(t("autoVersionLimit"))
+      .setDesc(t("autoVersionLimitDesc"))
+      .addText((text) => {
+        text.setPlaceholder("100")
+          .setValue(String(this.plugin.settings.autoVersionLimit));
+        const apply = async (value: string, snap: boolean) => {
+          const raw = Number(value.trim());
+          if (!Number.isFinite(raw) || !Number.isInteger(raw)) return;
+          if (!snap && (raw < 1 || raw > 256)) return;
+          const limit = clampAutoVersionLimit(raw);
+          if (snap && String(limit) !== value.trim()) {
+            text.setValue(String(limit));
+            new Notice(t("autoVersionLimitRange", { n: limit }));
+          }
+          if (limit === this.plugin.settings.autoVersionLimit) return;
+          this.plugin.settings.autoVersionLimit = limit;
+          await this.plugin.saveSettings();
+        };
+        text.onChange((value) => { void apply(value, false); });
+        text.inputEl.addEventListener("change", () => { void apply(text.getValue(), true); });
+      });
+
+    new Setting(containerEl)
+      .setName(t("openHistory"))
+      .setDesc(t("openHistoryDesc"))
+      .addButton((button) => {
+        button.setButtonText(t("openHistory")).onClick(() => {
+          this.plugin.openFileHistory();
+        });
+      });
+
+    if (this.plugin.settings.encryptNotes && this.plugin.settings.boundVaultId) {
+      new Setting(containerEl)
+        .setName(t("wipePlainHistory"))
+        .setDesc(t("wipePlainHistoryDesc"))
+        .addButton((button) => {
+          button.setButtonText(t("wipePlainHistory")).setWarning().onClick(() => {
+            wipePlaintextHistory(this.plugin);
+          });
+        });
+    }
 
     new Setting(containerEl)
       .setName(t("actions"))

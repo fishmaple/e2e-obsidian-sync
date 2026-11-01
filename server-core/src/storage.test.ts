@@ -29,6 +29,20 @@ class MemoryStore implements BlobStore {
   async delete(accountId: string, fileId: string): Promise<void> {
     this.objects.delete(`${accountId}/${fileId}`);
   }
+
+  async putVersion(accountId: string, versionId: string, json: string): Promise<void> {
+    this.objects.set(`${accountId}/history/${versionId}`, json);
+  }
+
+  async getVersion(accountId: string, versionId: string): Promise<string> {
+    const value = this.objects.get(`${accountId}/history/${versionId}`);
+    if (value === undefined) throw new Error("The object store has no content for this version");
+    return value;
+  }
+
+  async deleteVersion(accountId: string, versionId: string): Promise<void> {
+    this.objects.delete(`${accountId}/history/${versionId}`);
+  }
 }
 
 function config(dir: string, storage: AppConfig["storage"]): AppConfig {

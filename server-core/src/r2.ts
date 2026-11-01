@@ -16,6 +16,10 @@ function blobKey(accountId: string, fileId: string): string {
   return `vaults/${accountId}/${fileId}`;
 }
 
+function versionKey(accountId: string, versionId: string): string {
+  return `vaults/${accountId}/history/${versionId}`;
+}
+
 function stagingKey(accountId: string, fileId: string): string {
   return `${blobKey(accountId, fileId)}.upload`;
 }
@@ -71,6 +75,35 @@ export class R2Client {
 
   async delete(accountId: string, fileId: string): Promise<void> {
     await this.deleteKey(blobKey(accountId, fileId));
+  }
+
+  async putVersion(accountId: string, versionId: string, json: string): Promise<void> {
+    const body = Buffer.from(json, "utf8");
+    const response = await this.request("PUT", versionKey(accountId, versionId), undefined, body);
+    if (!response.ok) throw new Error(`R2 upload failed (${response.status})`);
+  }
+
+  async getVersion(accountId: string, versionId: string): Promise<string> {
+    const response = await this.request("GET", versionKey(accountId, versionId));
+    if (response.status === 404) throw new Error("The object store has no content for this version");
+    if (!response.ok) throw new Error(`R2 read failed (${response.status})`);
+    return new TextDecoder().decode(response.body);
+  }
+
+  async deleteVersion(accountId: string, versionId: string): Promise<void> {
+    await this.deleteKey(versionKey(accountId, versionId));
+  }
+
+  presignVersionDownload(accountId: string, versionId: string, expiresSeconds: number): string {
+    return presignR2Url({
+      method: "GET",
+      endpoint: this.endpoint,
+      bucket: this.bucket,
+      key: versionKey(accountId, versionId),
+      accessKeyId: this.credentials.accessKeyId,
+      secretAccessKey: this.credentials.secretAccessKey,
+      expiresSeconds,
+    });
   }
 
   presignDownload(accountId: string, fileId: string, expiresSeconds: number): string {

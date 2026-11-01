@@ -1,4 +1,5 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
+import type { VersionDownload } from "../../shared/src/history";
 import {
   MAX_BODY_BYTES,
   type DownloadUrl,
@@ -80,6 +81,44 @@ export async function listTransferUrls(input: {
   return { downloads, uploads, conflicts, missing };
 }
 
+export async function listVersionDownloads(input: {
+  config: AppConfig;
+  db: SyncDb;
+  accountId: string;
+  fileId: string;
+  vaultName: string;
+  versionIds: string[];
+  origin: string;
+  now?: number;
+}): Promise<VersionDownload[]> {
+  if (input.versionIds.length > 20) throw new HttpError(400, "Too many versions in one download");
+  const now = input.now ?? Date.now();
+  const downloads: VersionDownload[] = [];
+  for (const versionId of input.versionIds) {
+    if (!FILE_ID.test(versionId)) throw new HttpError(400, "Invalid version id");
+    const row = await input.db.findFileVersion(input.accountId, versionId);
+    if (!row || row.fileId !== input.fileId || row.vaultName !== input.vaultName) {
+      throw new HttpError(404, "This version is not on the server");
+    }
+    const link = await versionDownloadLink(input.config, input.db, input.accountId, versionId, input.origin, now);
+    downloads.push({
+      fileId: row.fileId,
+      versionId: row.versionId,
+      url: link.url,
+      expiresAt: link.expiresAt,
+      pathCipher: JSON.parse(row.pathCipher) as PayloadCipher,
+      contentMac: row.contentMac,
+      size: row.size,
+      mtime: row.mtime,
+      createdAt: row.createdAt,
+      encoding: row.encoding,
+      tipRev: row.tipRev,
+      syncTrigger: row.syncTrigger,
+    });
+  }
+  return downloads;
+}
+
 export function directRequestValid(
   secret: string,
   method: string,
@@ -94,6 +133,30 @@ export function directRequestValid(
   if (!Number.isSafeInteger(exp) || exp < now || exp > now + URL_TTL_MS + 5 * 60 * 1000) return false;
   const expected = directSignature(secret, method, accountId, fileId, exp);
   return timingSafeEqual(Buffer.from(sig), Buffer.from(expected));
+}
+
+export function versionRequestValid(
+  secret: string,
+  method: string,
+  accountId: string,
+  versionId: string,
+  expRaw: string,
+  sig: string,
+  now = Date.now(),
+): boolean {
+  if (!/^\d+$/.test(expRaw) || !/^[0-9a-f]{64}$/.test(sig)) return false;
+  const exp = Number(expRaw);
+  if (!Number.isSafeInteger(exp) || exp < now || exp > now + URL_TTL_MS + 5 * 60 * 1000) return false;
+  const expected = versionSignature(secret, method, accountId, versionId, exp);
+  return timingSafeEqual(Buffer.from(sig), Buffer.from(expected));
+}
+
+export async function serverVersionDownload(blobs: BlobStore, accountId: string, versionId: string): Promise<string> {
+  try {
+    return await blobs.getVersion(accountId, versionId);
+  } catch {
+    throw new HttpError(404, "This version is not on the server");
+  }
 }
 
 export async function acceptServerUpload(
@@ -206,6 +269,36 @@ async function uploadLink(
   const remote = openR2(config);
   if (remote) await remote.deleteStaging(accountId, fileId);
   return { fileId, url: serverUrl(config, origin, "PUT", accountId, fileId, exp), expiresAt: exp };
+}
+
+async function versionDownloadLink(
+  config: AppConfig,
+  db: SyncDb,
+  accountId: string,
+  versionId: string,
+  origin: string,
+  now: number,
+): Promise<{ url: string; expiresAt: number }> {
+  const exp = now + URL_TTL_MS;
+  const inline = await db.getVersionBlob(accountId, versionId);
+  const onR2 = config.storage.kind === "r2" && (inline === undefined || storedBytes(inline) >= config.storage.inlineMaxBytes);
+  if (onR2) {
+    const remote = openR2(config);
+    if (!remote) throw new HttpError(500, "R2 storage is not ready");
+    return {
+      url: remote.presignVersionDownload(accountId, versionId, Math.ceil(URL_TTL_MS / 1000)),
+      expiresAt: exp,
+    };
+  }
+  const sig = versionSignature(config.sessionSecret, "GET", accountId, versionId, exp);
+  return {
+    url: `${origin}/api/v1/direct-version/${accountId}/${versionId}?exp=${exp}&sig=${sig}`,
+    expiresAt: exp,
+  };
+}
+
+function versionSignature(secret: string, method: string, accountId: string, versionId: string, exp: number): string {
+  return createHmac("sha256", secret).update(`version\n${method.toUpperCase()}\n${accountId}\n${versionId}\n${exp}`).digest("hex");
 }
 
 function serverUrl(config: AppConfig, origin: string, method: string, accountId: string, fileId: string, exp: number): string {

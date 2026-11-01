@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { bytesToBase64Url, randomBytes } from "../../shared/src/codec";
+import { autoVersionsToDrop, type SyncTrigger } from "../../shared/src/history";
 import type { AppConfig } from "./config";
 import { openMysql, openPostgres, openSqlite, type Queryable } from "./sql";
 
@@ -38,8 +39,28 @@ export interface ChangeRow {
 }
 
 export type PutRevisionResult =
-  | { status: "created" | "updated" | "unchanged"; row: ObjectRow }
+  | { status: "created" | "updated" | "unchanged"; row: ObjectRow; droppedVersionIds: string[] }
   | { status: "conflict"; reason: "parent_rev" | "deleted"; current: ObjectRow | null };
+
+export interface FileVersionRow {
+  accountId: string;
+  versionId: string;
+  fileId: string;
+  vaultName: string;
+  pathCipher: string;
+  contentMac: string;
+  size: number;
+  mtime: number;
+  createdAt: number;
+  encoding: Encoding;
+  tipRev: number;
+  syncTrigger: SyncTrigger;
+}
+
+export interface RetentionRow {
+  autoLimit: number;
+  manualLimit: number | null;
+}
 
 export interface VaultStatRow {
   id: string;
@@ -90,6 +111,22 @@ interface ChangeSqlRow {
 }
 
 const OBJECT_COLUMNS = "account_id, file_id, vault_name, path_cipher, content_mac, size, mtime, updated_at, encoding, rev";
+const VERSION_COLUMNS = "account_id, version_id, file_id, vault_name, path_cipher, content_mac, size, mtime, created_at, encoding, tip_rev, sync_trigger";
+
+interface VersionSqlRow {
+  account_id: string;
+  version_id: string;
+  file_id: string;
+  vault_name: string | null;
+  path_cipher: string;
+  content_mac: string;
+  size: number | string;
+  mtime: number | string;
+  created_at: number | string;
+  encoding: string | null;
+  tip_rev: number | string | null;
+  sync_trigger: string | null;
+}
 
 export class SyncDb {
   constructor(private readonly sql: Queryable) {}
@@ -424,13 +461,14 @@ export class SyncDb {
     row: Omit<ObjectRow, "rev" | "updatedAt">,
     parentRev: number | null,
     writeBlob: () => Promise<void>,
+    recordVersion?: (row: ObjectRow) => Promise<string[]>,
   ): Promise<PutRevisionResult> {
     await this.sql.exec("BEGIN");
     try {
       const existing = await this.findObject(row.accountId, row.fileId);
       if (existing && existing.contentMac === row.contentMac && existing.encoding === row.encoding) {
         await this.sql.exec("COMMIT");
-        return { status: "unchanged", row: existing };
+        return { status: "unchanged", row: existing, droppedVersionIds: [] };
       }
       if (!existing) {
         if (parentRev !== null) {
@@ -441,8 +479,9 @@ export class SyncDb {
         await this.insertObject(created);
         await this.appendChange(created, "upsert");
         await writeBlob();
+        const droppedVersionIds = recordVersion ? await recordVersion(created) : [];
         await this.sql.exec("COMMIT");
-        return { status: "created", row: created };
+        return { status: "created", row: created, droppedVersionIds };
       }
       if (parentRev === null || parentRev !== existing.rev) {
         await this.sql.exec("COMMIT");
@@ -473,8 +512,9 @@ export class SyncDb {
       }
       await this.appendChange(updated, "upsert");
       await writeBlob();
+      const droppedVersionIds = recordVersion ? await recordVersion(updated) : [];
       await this.sql.exec("COMMIT");
-      return { status: "updated", row: updated };
+      return { status: "updated", row: updated, droppedVersionIds };
     } catch (error) {
       try {
         await this.sql.exec("ROLLBACK");
@@ -584,12 +624,22 @@ export class SyncDb {
     return typeof row.content === "string" ? row.content : Buffer.from(row.content).toString("utf8");
   }
 
-  async deleteVault(accountId: string, vaultId: string): Promise<string[] | undefined> {
+  async deleteVault(accountId: string, vaultId: string): Promise<{ fileIds: string[]; versionIds: string[] } | undefined> {
     const vault = await this.findVaultById(accountId, vaultId);
     if (!vault) return undefined;
     const files = await this.listObjects(accountId, vault.name);
+    const versionRows = await this.sql.all<{ version_id: string; file_id: string }>(
+      "SELECT version_id, file_id FROM file_versions WHERE account_id = ? AND vault_name = ?",
+      [accountId, vault.name],
+    );
+    const versionIds = versionRows.map((row) => row.version_id);
+    const retentionIds = new Set<string>([...files.map((file) => file.fileId), ...versionRows.map((row) => row.file_id)]);
     await this.sql.exec("BEGIN");
     try {
+      for (const fileId of retentionIds) {
+        await this.sql.run("DELETE FROM file_retention WHERE account_id = ? AND file_id = ?", [accountId, fileId]);
+      }
+      await this.sql.run("DELETE FROM file_versions WHERE account_id = ? AND vault_name = ?", [accountId, vault.name]);
       await this.sql.run("DELETE FROM objects WHERE account_id = ? AND vault_name = ?", [accountId, vault.name]);
       await this.sql.run("DELETE FROM changes WHERE account_id = ? AND vault_name = ?", [accountId, vault.name]);
       await this.sql.run("DELETE FROM vault_cursors WHERE account_id = ? AND vault_name = ?", [accountId, vault.name]);
@@ -599,11 +649,172 @@ export class SyncDb {
       await this.sql.exec("ROLLBACK");
       throw error;
     }
-    return files.map((file) => file.fileId);
+    return { fileIds: files.map((file) => file.fileId), versionIds };
   }
 
   async deleteBlob(accountId: string, fileId: string): Promise<void> {
     await this.sql.run("DELETE FROM blobs WHERE account_id = ? AND file_id = ?", [accountId, fileId]);
+  }
+
+  async putVersionBlob(accountId: string, versionId: string, content: string): Promise<void> {
+    const existing = await this.sql.get<{ version_id: string }>(
+      "SELECT version_id FROM version_blobs WHERE account_id = ? AND version_id = ?",
+      [accountId, versionId],
+    );
+    if (existing) {
+      await this.sql.run(
+        "UPDATE version_blobs SET content = ? WHERE account_id = ? AND version_id = ?",
+        [content, accountId, versionId],
+      );
+      return;
+    }
+    await this.sql.run(
+      "INSERT INTO version_blobs (account_id, version_id, content) VALUES (?, ?, ?)",
+      [accountId, versionId, content],
+    );
+  }
+
+  async getVersionBlob(accountId: string, versionId: string): Promise<string | undefined> {
+    const row = await this.sql.get<{ content: string | Buffer }>(
+      "SELECT content FROM version_blobs WHERE account_id = ? AND version_id = ?",
+      [accountId, versionId],
+    );
+    if (!row) return undefined;
+    return typeof row.content === "string" ? row.content : Buffer.from(row.content).toString("utf8");
+  }
+
+  async deleteVersionBlob(accountId: string, versionId: string): Promise<void> {
+    await this.sql.run("DELETE FROM version_blobs WHERE account_id = ? AND version_id = ?", [accountId, versionId]);
+  }
+
+  async getRetention(accountId: string, fileId: string): Promise<RetentionRow | undefined> {
+    const row = await this.sql.get<{ auto_limit: number | string; manual_limit: number | string | null }>(
+      "SELECT auto_limit, manual_limit FROM file_retention WHERE account_id = ? AND file_id = ?",
+      [accountId, fileId],
+    );
+    if (!row) return undefined;
+    const manual = row.manual_limit === null || row.manual_limit === undefined ? null : Number(row.manual_limit);
+    return {
+      autoLimit: Number(row.auto_limit),
+      manualLimit: manual !== null && Number.isFinite(manual) ? manual : null,
+    };
+  }
+
+  async saveRetention(
+    accountId: string,
+    fileId: string,
+    autoLimit: number,
+    manualLimit: number | null | undefined,
+  ): Promise<RetentionRow> {
+    const existing = await this.getRetention(accountId, fileId);
+    const manual = manualLimit === undefined ? (existing?.manualLimit ?? null) : manualLimit;
+    if (!existing) {
+      await this.sql.run(
+        "INSERT INTO file_retention (account_id, file_id, auto_limit, manual_limit) VALUES (?, ?, ?, ?)",
+        [accountId, fileId, autoLimit, manual],
+      );
+    } else {
+      await this.sql.run(
+        "UPDATE file_retention SET auto_limit = ?, manual_limit = ? WHERE account_id = ? AND file_id = ?",
+        [autoLimit, manual, accountId, fileId],
+      );
+    }
+    return { autoLimit, manualLimit: manual };
+  }
+
+  async insertFileVersion(row: FileVersionRow): Promise<FileVersionRow> {
+    const createdAt = await this.nextVersionTime(row.accountId, row.fileId, row.createdAt);
+    const stored = { ...row, createdAt };
+    await this.sql.run(`
+      INSERT INTO file_versions (
+        account_id, version_id, file_id, vault_name, path_cipher, content_mac,
+        size, mtime, created_at, encoding, tip_rev, sync_trigger
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `, [
+      stored.accountId,
+      stored.versionId,
+      stored.fileId,
+      stored.vaultName,
+      stored.pathCipher,
+      stored.contentMac,
+      stored.size,
+      stored.mtime,
+      stored.createdAt,
+      stored.encoding,
+      stored.tipRev,
+      stored.syncTrigger,
+    ]);
+    return stored;
+  }
+
+  async findFileVersion(accountId: string, versionId: string): Promise<FileVersionRow | undefined> {
+    const row = await this.sql.get<VersionSqlRow>(`
+      SELECT ${VERSION_COLUMNS}
+      FROM file_versions WHERE account_id = ? AND version_id = ?
+    `, [accountId, versionId]);
+    return row ? mapVersion(row) : undefined;
+  }
+
+  async listFileVersions(accountId: string, fileId: string, vaultName: string, limit: number): Promise<FileVersionRow[]> {
+    const rows = await this.sql.all<VersionSqlRow>(`
+      SELECT ${VERSION_COLUMNS}
+      FROM file_versions
+      WHERE account_id = ? AND file_id = ? AND vault_name = ?
+      ORDER BY created_at DESC, version_id DESC
+      LIMIT ?
+    `, [accountId, fileId, vaultName, limit]);
+    return rows.map(mapVersion);
+  }
+
+  async dropExcessAutoVersions(accountId: string, fileId: string, autoLimit: number): Promise<string[]> {
+    const rows = await this.sql.all<{ version_id: string; created_at: number | string; sync_trigger: string }>(`
+      SELECT version_id, created_at, sync_trigger
+      FROM file_versions WHERE account_id = ? AND file_id = ?
+    `, [accountId, fileId]);
+    const drop = autoVersionsToDrop(rows.map((row) => ({
+      versionId: row.version_id,
+      createdAt: Number(row.created_at),
+      syncTrigger: syncTriggerOf(row.sync_trigger),
+    })), autoLimit);
+    for (const versionId of drop) {
+      await this.sql.run(
+        "DELETE FROM file_versions WHERE account_id = ? AND version_id = ?",
+        [accountId, versionId],
+      );
+    }
+    return drop;
+  }
+
+  async deletePlaintextVersions(accountId: string, vaultName: string): Promise<string[]> {
+    const rows = await this.sql.all<{ version_id: string }>(`
+      SELECT version_id FROM file_versions
+      WHERE account_id = ? AND vault_name = ? AND encoding = 'plain'
+    `, [accountId, vaultName]);
+    const ids = rows.map((row) => row.version_id);
+    await this.sql.exec("BEGIN");
+    try {
+      for (const versionId of ids) {
+        await this.sql.run(
+          "DELETE FROM file_versions WHERE account_id = ? AND version_id = ?",
+          [accountId, versionId],
+        );
+      }
+      await this.sql.exec("COMMIT");
+    } catch (error) {
+      await this.sql.exec("ROLLBACK");
+      throw error;
+    }
+    return ids;
+  }
+
+  private async nextVersionTime(accountId: string, fileId: string, candidate: number): Promise<number> {
+    const row = await this.sql.get<{ max_at: number | string | null }>(
+      "SELECT MAX(created_at) AS max_at FROM file_versions WHERE account_id = ? AND file_id = ?",
+      [accountId, fileId],
+    );
+    const max = Number(row?.max_at ?? 0);
+    const base = Number.isFinite(candidate) ? candidate : Date.now();
+    return Math.max(base, max + 1);
   }
 
   async putUploadGrant(accountId: string, fileId: string, bytes: number, kind: "server" | "r2", expiresAt: number): Promise<void> {
@@ -846,6 +1057,34 @@ function schema(dialect: Queryable["dialect"]): string[] {
       content ${large} NOT NULL,
       PRIMARY KEY (account_id, file_id)
     )`,
+    `CREATE TABLE IF NOT EXISTS file_versions (
+      account_id VARCHAR(64) NOT NULL,
+      version_id VARCHAR(64) NOT NULL,
+      file_id VARCHAR(64) NOT NULL,
+      vault_name VARCHAR(200) NOT NULL DEFAULT '',
+      path_cipher ${large} NOT NULL,
+      content_mac VARCHAR(64) NOT NULL,
+      size BIGINT NOT NULL,
+      mtime BIGINT NOT NULL,
+      created_at BIGINT NOT NULL,
+      encoding VARCHAR(16) NOT NULL DEFAULT 'e2ee',
+      tip_rev BIGINT NOT NULL,
+      sync_trigger VARCHAR(16) NOT NULL,
+      PRIMARY KEY (account_id, version_id)
+    )`,
+    `CREATE TABLE IF NOT EXISTS version_blobs (
+      account_id VARCHAR(64) NOT NULL,
+      version_id VARCHAR(64) NOT NULL,
+      content ${large} NOT NULL,
+      PRIMARY KEY (account_id, version_id)
+    )`,
+    `CREATE TABLE IF NOT EXISTS file_retention (
+      account_id VARCHAR(64) NOT NULL,
+      file_id VARCHAR(64) NOT NULL,
+      auto_limit INTEGER NOT NULL,
+      manual_limit INTEGER,
+      PRIMARY KEY (account_id, file_id)
+    )`,
     `CREATE TABLE IF NOT EXISTS oauth_states (
       state VARCHAR(128) PRIMARY KEY,
       nonce VARCHAR(128) NOT NULL,
@@ -884,6 +1123,29 @@ function mapObject(row: ObjectSqlRow): ObjectRow {
     encoding: row.encoding === "plain" ? "plain" : "e2ee",
     rev: Number.isSafeInteger(rev) && rev > 0 ? rev : 1,
   };
+}
+
+function mapVersion(row: VersionSqlRow): FileVersionRow {
+  const tipRev = Number(row.tip_rev ?? 0);
+  return {
+    accountId: row.account_id,
+    versionId: row.version_id,
+    fileId: row.file_id,
+    vaultName: row.vault_name ?? "",
+    pathCipher: row.path_cipher,
+    contentMac: row.content_mac,
+    size: Number(row.size),
+    mtime: Number(row.mtime),
+    createdAt: Number(row.created_at),
+    encoding: row.encoding === "plain" ? "plain" : "e2ee",
+    tipRev: Number.isSafeInteger(tipRev) && tipRev > 0 ? tipRev : 0,
+    syncTrigger: syncTriggerOf(row.sync_trigger),
+  };
+}
+
+function syncTriggerOf(value: string | null | undefined): SyncTrigger {
+  if (value === "manual" || value === "restore" || value === "auto") return value;
+  return "auto";
 }
 
 function mapChange(row: ChangeSqlRow): ChangeRow {

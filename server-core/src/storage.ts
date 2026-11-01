@@ -9,6 +9,9 @@ export interface BlobStore {
   put(accountId: string, fileId: string, json: string): Promise<void>;
   get(accountId: string, fileId: string): Promise<string>;
   delete(accountId: string, fileId: string): Promise<void>;
+  putVersion(accountId: string, versionId: string, json: string): Promise<void>;
+  getVersion(accountId: string, versionId: string): Promise<string>;
+  deleteVersion(accountId: string, versionId: string): Promise<void>;
 }
 
 export async function prepareStorage(config: AppConfig): Promise<AppConfig> {
@@ -66,6 +69,32 @@ export class HybridBlobStore implements BlobStore {
     await this.db.deleteBlob(accountId, fileId);
     await this.remote.delete(accountId, fileId);
   }
+
+  async putVersion(accountId: string, versionId: string, json: string): Promise<void> {
+    if (storedBytes(json) < this.inlineMaxBytes) {
+      await this.db.putVersionBlob(accountId, versionId, json);
+      await this.remote.deleteVersion(accountId, versionId);
+      return;
+    }
+    await this.remote.putVersion(accountId, versionId, json);
+    await this.db.deleteVersionBlob(accountId, versionId);
+  }
+
+  async getVersion(accountId: string, versionId: string): Promise<string> {
+    const inline = await this.db.getVersionBlob(accountId, versionId);
+    if (inline !== undefined && storedBytes(inline) < this.inlineMaxBytes) return inline;
+    try {
+      return await this.remote.getVersion(accountId, versionId);
+    } catch (error) {
+      if (inline !== undefined) return inline;
+      throw error;
+    }
+  }
+
+  async deleteVersion(accountId: string, versionId: string): Promise<void> {
+    await this.db.deleteVersionBlob(accountId, versionId);
+    await this.remote.deleteVersion(accountId, versionId);
+  }
 }
 
 export function storedBytes(json: string): number {
@@ -92,6 +121,24 @@ class FileBlobStore implements BlobStore {
   async delete(accountId: string, fileId: string): Promise<void> {
     rmSync(this.path(accountId, fileId), { force: true });
   }
+
+  private versionPath(accountId: string, versionId: string): string {
+    return join(this.dataDir, "blobs", accountId, "history", versionId);
+  }
+
+  async putVersion(accountId: string, versionId: string, json: string): Promise<void> {
+    const path = this.versionPath(accountId, versionId);
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, json);
+  }
+
+  async getVersion(accountId: string, versionId: string): Promise<string> {
+    return readFileSync(this.versionPath(accountId, versionId), "utf8");
+  }
+
+  async deleteVersion(accountId: string, versionId: string): Promise<void> {
+    rmSync(this.versionPath(accountId, versionId), { force: true });
+  }
 }
 
 class DatabaseBlobStore implements BlobStore {
@@ -109,6 +156,20 @@ class DatabaseBlobStore implements BlobStore {
 
   async delete(accountId: string, fileId: string): Promise<void> {
     await this.db.deleteBlob(accountId, fileId);
+  }
+
+  async putVersion(accountId: string, versionId: string, json: string): Promise<void> {
+    await this.db.putVersionBlob(accountId, versionId, json);
+  }
+
+  async getVersion(accountId: string, versionId: string): Promise<string> {
+    const content = await this.db.getVersionBlob(accountId, versionId);
+    if (content === undefined) throw new Error("The database has no content for this version");
+    return content;
+  }
+
+  async deleteVersion(accountId: string, versionId: string): Promise<void> {
+    await this.db.deleteVersionBlob(accountId, versionId);
   }
 }
 
@@ -136,8 +197,44 @@ export class QiniuBlobStore implements BlobStore {
     return response.text();
   }
 
+  async putVersion(accountId: string, versionId: string, json: string): Promise<void> {
+    await this.putKey(versionObjectKey(accountId, versionId), json);
+  }
+
+  async getVersion(accountId: string, versionId: string): Promise<string> {
+    return this.getKey(versionObjectKey(accountId, versionId));
+  }
+
+  async deleteVersion(accountId: string, versionId: string): Promise<void> {
+    await this.deleteKey(versionObjectKey(accountId, versionId));
+  }
+
   async delete(accountId: string, fileId: string): Promise<void> {
-    const entry = urlSafeBase64(`${this.qiniu.bucket}:${objectKey(accountId, fileId)}`);
+    await this.deleteKey(objectKey(accountId, fileId));
+  }
+
+  private async putKey(key: string, json: string): Promise<void> {
+    const token = qiniuUploadToken(this.qiniu, key);
+    const form = new FormData();
+    form.set("token", token);
+    form.set("key", key);
+    form.set("file", new Blob([json]), "blob.json");
+    const response = await fetch(this.qiniu.uploadUrl, { method: "POST", body: form });
+    if (!response.ok) {
+      const detail = await response.text();
+      throw new Error(`Qiniu upload failed (${response.status}) ${detail}`.trim());
+    }
+  }
+
+  private async getKey(key: string): Promise<string> {
+    const url = qiniuDownloadUrl(this.qiniu, key);
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`Qiniu read failed (${response.status})`);
+    return response.text();
+  }
+
+  private async deleteKey(key: string): Promise<void> {
+    const entry = urlSafeBase64(`${this.qiniu.bucket}:${key}`);
     const path = `/delete/${entry}`;
     const sign = urlSafeBase64(createHmac("sha1", this.qiniu.secretKey).update(`${path}\n`).digest());
     const response = await fetch(`${this.qiniu.rsUrl}${path}`, {
@@ -152,6 +249,10 @@ export class QiniuBlobStore implements BlobStore {
 
 export function objectKey(accountId: string, fileId: string): string {
   return `vaults/${accountId}/${fileId}`;
+}
+
+export function versionObjectKey(accountId: string, versionId: string): string {
+  return `vaults/${accountId}/history/${versionId}`;
 }
 
 export function qiniuUploadToken(qiniu: QiniuConfig, key: string): string {
