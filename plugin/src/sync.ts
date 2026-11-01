@@ -1,6 +1,7 @@
 import { FileSystemAdapter, Modal, Notice, TFile, type App, type Vault } from "obsidian";
 import { bytesToBase64, randomBytes } from "../../shared/src/codec";
 import { contentMac, deriveKeys, fileIdForPath, openBytes, plainFileId, plainMac, sealBytes } from "../../shared/src/crypto";
+import { clampAutoVersionLimit } from "../../shared/src/history";
 import { MAX_FILE_BYTES, MIN_SECRET_LENGTH, remoteRev, type ChangeEntry, type Encoding, type PutResult, type RemoteFile, type VaultStat } from "../../shared/src/protocol";
 import { decideSyncAction } from "../../shared/src/reconcile";
 import { SyncClient, SyncConflictError, fetchBootstrap, openExternal, resolveSyncHost } from "./client";
@@ -69,8 +70,8 @@ export function propagatePlugin(plugin: E2eeSyncPlugin): string[] {
   return installed;
 }
 
-export async function pushVault(plugin: E2eeSyncPlugin): Promise<string> {
-  const ready = await openClient(plugin);
+export async function pushVault(plugin: E2eeSyncPlugin, trigger: "auto" | "manual"): Promise<string> {
+  const ready = await openBoundClient(plugin, trigger);
   const encoding: Encoding = plugin.settings.encryptNotes ? "e2ee" : "plain";
   if (encoding === "plain") {
     const boot = await fetchBootstrap(ready.host, plugin.settings.accessToken);
@@ -317,7 +318,7 @@ interface PendingConflict {
   attempt?: number;
 }
 
-type ReadyClient = Awaited<ReturnType<typeof openClient>>;
+type ReadyClient = Awaited<ReturnType<typeof openBoundClient>>;
 
 async function loadRemote(plugin: E2eeSyncPlugin, ready: ReadyClient): Promise<{ remote: Map<string, RemoteFile>; cursor: number | null }> {
   const saved = plugin.settings.changeCursor;
@@ -449,7 +450,25 @@ async function putFile(
     mtime,
     encoding,
     parentRev,
+  }, {
+    syncTrigger: ready.syncTrigger,
+    autoLimit: ready.autoLimitFor(fileId),
   });
+}
+
+export async function applyRestoredFile(
+  plugin: E2eeSyncPlugin,
+  fileId: string,
+  path: string,
+  bytes: Uint8Array,
+  meta: { mtime: number; contentMac: string; encoding: Encoding; rev: number },
+): Promise<void> {
+  await writeVaultFile(plugin.app.vault, path, bytes);
+  stampMtime(plugin, path, meta.mtime);
+  const stat = fileStat(plugin, path, meta.mtime, bytes.byteLength);
+  plugin.settings.index[fileId] = syncedEntry(path, stat.mtime, stat.size, meta.contentMac, meta.encoding, meta.rev);
+  plugin.markClean(path);
+  await plugin.saveSettings();
 }
 
 async function uploadTracked(
@@ -760,7 +779,7 @@ function conflictCopyPath(vault: Vault, path: string, device: string, when: Date
 
 async function pullRemote(
   plugin: E2eeSyncPlugin,
-  ready: Awaited<ReturnType<typeof openClient>>,
+  ready: Awaited<ReturnType<typeof openBoundClient>>,
   remoteFile: RemoteFile,
   index: E2eeSyncPlugin["settings"]["index"],
   enqueue: <T>(fn: () => Promise<T>) => Promise<T>,
@@ -1062,12 +1081,14 @@ export function notifyResult(manual: boolean, summary: string): void {
   if (manual) new Notice(summary);
 }
 
-async function openClient(plugin: E2eeSyncPlugin): Promise<{
+export async function openBoundClient(plugin: E2eeSyncPlugin, syncTrigger: "auto" | "manual" = "manual"): Promise<{
   host: string;
   client: SyncClient;
   keys: Awaited<ReturnType<typeof deriveKeys>> | null;
   vaultName: string;
   vaultId: string;
+  syncTrigger: "auto" | "manual";
+  autoLimitFor: (fileId: string) => number;
 }> {
   const token = plugin.settings.apiToken.trim();
   if (!token) throw new Error(t("needLogin"));
@@ -1085,6 +1106,11 @@ async function openClient(plugin: E2eeSyncPlugin): Promise<{
     keys,
     vaultName,
     vaultId,
+    syncTrigger,
+    autoLimitFor: (fileId: string) => {
+      const override = plugin.settings.versionLimitOverrides[fileId];
+      return clampAutoVersionLimit(typeof override === "number" ? override : plugin.settings.autoVersionLimit);
+    },
   };
 }
 

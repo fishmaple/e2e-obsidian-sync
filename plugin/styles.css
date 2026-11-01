@@ -101,6 +101,57 @@
   font-family: var(--font-monospace);
 }
 
+.e2ee-sync-history-modal {
+  width: min(760px, 94vw);
+}
+
+.e2ee-sync-days {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.e2ee-sync-day {
+  width: 100%;
+  text-align: left;
+  white-space: pre-wrap;
+}
+
+.e2ee-sync-day-body {
+  display: grid;
+  gap: 8px;
+  margin: 0 0 8px 12px;
+}
+
+.e2ee-sync-version {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.e2ee-sync-diff {
+  max-height: 60vh;
+  overflow: auto;
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+}
+
+.e2ee-sync-diff-add {
+  color: var(--text-success);
+  white-space: pre-wrap;
+}
+
+.e2ee-sync-diff-del {
+  color: var(--text-error);
+  white-space: pre-wrap;
+}
+
+.e2ee-sync-diff-eq {
+  color: var(--text-muted);
+  white-space: pre-wrap;
+}
+
 @media (max-width: 600px) {
   .e2ee-sync-conflict-columns {
     grid-template-columns: 1fr;
