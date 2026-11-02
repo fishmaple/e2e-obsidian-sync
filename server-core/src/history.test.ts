@@ -8,7 +8,7 @@ import { FLUSH_DELTA_BYTES, groupVersionsByDay, type RetentionView, type Version
 import type { ConflictBody, PutResult } from "../../shared/src/protocol";
 import { createApp } from "./app";
 import type { AppConfig } from "./config";
-import { openDatabase } from "./db";
+import { openDatabase, TipMovedError } from "./db";
 
 const FILE = "ab".repeat(32);
 const OTHER = "cd".repeat(32);
@@ -458,6 +458,197 @@ test("plaintext wipe removes plain deltas and plain checkpoints and leaves ciphe
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("manual sync lists every file with an open delta and auto sync does not", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "e2ee-history-manual-flush-"));
+  const db = await openDatabase(testConfig(dir));
+  const app = createApp({ config: testConfig(dir), db });
+  try {
+    const token = await devToken(app);
+    const quiet = "ef".repeat(32);
+    await putDelta(app, token, FILE, "手动甲", "a1");
+    await putDelta(app, token, OTHER, "手动甲", "b2");
+    const untouched = await authed(app, token, "PUT", `/api/v1/objects/${quiet}`, plainObject("手动甲", "c3".repeat(32), "quiet", null, {
+      syncTrigger: "auto",
+    }));
+    assert.equal(untouched.status, 200, await untouched.clone().text());
+
+    const vaults = await authed(app, token, "GET", "/api/v1/vaults");
+    const vaultId = (await vaults.json() as { vaults: { id: string; name: string }[] }).vaults.find((vault) => vault.name === "手动甲")?.id ?? "";
+    const auto = await authed(app, token, "GET", `/api/v1/vaults/${vaultId}/history-flush`);
+    assert.deepEqual(await auto.json(), { files: [] });
+    const explicitAuto = await authed(app, token, "GET", `/api/v1/vaults/${vaultId}/history-flush?syncTrigger=auto`);
+    assert.deepEqual(await explicitAuto.json(), { files: [] });
+    const bad = await authed(app, token, "GET", `/api/v1/vaults/${vaultId}/history-flush?syncTrigger=restore`);
+    assert.equal(bad.status, 400);
+
+    const manual = await authed(app, token, "GET", `/api/v1/vaults/${vaultId}/history-flush?syncTrigger=manual`);
+    assert.equal(manual.status, 200, await manual.clone().text());
+    const files = (await manual.json() as { files: { fileId: string; reason: string; pendingCount: number }[] }).files;
+    assert.deepEqual(files.map((file) => file.fileId).sort(), [FILE, OTHER].sort());
+    assert.ok(files.every((file) => file.reason === "manual" && file.pendingCount === 1));
+    assert.equal(files.some((file) => file.fileId === quiet), false);
+
+    for (const fileId of [FILE, OTHER]) {
+      const tip = await authed(app, token, "GET", `/api/v1/objects/${fileId}`);
+      const tipBody = await tip.json() as { contentCipher: { v: number; raw: string }; rev: number; contentMac: string; size: number; mtime: number; encoding: string };
+      const sealed = await authed(app, token, "POST", `/api/v1/files/${fileId}/checkpoints`, {
+        vault: vaultId,
+        contentCipher: tipBody.contentCipher,
+        contentMac: tipBody.contentMac,
+        size: tipBody.size,
+        mtime: tipBody.mtime,
+        encoding: tipBody.encoding,
+        tipRev: tipBody.rev,
+        syncTrigger: "manual",
+      });
+      assert.equal(sealed.status, 200, await sealed.clone().text());
+      assert.equal((await sealed.json() as { historyKind: string }).historyKind, "checkpoint");
+    }
+    const after = await authed(app, token, "GET", `/api/v1/vaults/${vaultId}/history-flush?sync_trigger=manual`);
+    assert.deepEqual(await after.json(), { files: [] });
+  } finally {
+    await db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a checkpoint does not fold deltas from a newer tip, and a moved tip is a conflict", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "e2ee-history-seal-race-"));
+  const db = await openDatabase(testConfig(dir));
+  const app = createApp({ config: testConfig(dir), db });
+  try {
+    const token = await devToken(app);
+    const first = await putDelta(app, token, FILE, "竞赛", "d4");
+    const accountId = accountIdIn(dir);
+    const open = await db.findFileVersion(accountId, first.deltaId);
+    assert.ok(open);
+    const rogueId = "99".repeat(32);
+    await db.insertFileVersion({
+      ...open,
+      versionId: rogueId,
+      tipRev: 99,
+      contentMac: "99".repeat(32),
+      createdAt: Date.now(),
+      baseVersionId: open.versionId,
+      sealed: false,
+      foldedInto: "",
+      patchBytes: 8,
+      kind: "delta",
+      syncTrigger: "auto",
+    });
+    await db.putPatch(accountId, rogueId, JSON.stringify(plainPatch("newer-than-tip")));
+
+    const vaults = await authed(app, token, "GET", "/api/v1/vaults");
+    const vaultId = (await vaults.json() as { vaults: { id: string; name: string }[] }).vaults.find((vault) => vault.name === "竞赛")?.id ?? "";
+    const tip = await authed(app, token, "GET", `/api/v1/objects/${FILE}`);
+    const tipBody = await tip.json() as { contentCipher: { v: number; raw: string }; rev: number; contentMac: string; size: number; mtime: number; encoding: string };
+    const sealed = await authed(app, token, "POST", `/api/v1/files/${FILE}/checkpoints`, {
+      vault: vaultId,
+      contentCipher: tipBody.contentCipher,
+      contentMac: tipBody.contentMac,
+      size: tipBody.size,
+      mtime: tipBody.mtime,
+      encoding: tipBody.encoding,
+      tipRev: tipBody.rev,
+      syncTrigger: "auto",
+    });
+    assert.equal(sealed.status, 200, await sealed.clone().text());
+    const checkpointId = (await sealed.json() as { versionId: string }).versionId;
+
+    const listed = await authed(app, token, "GET", `/api/v1/files/${FILE}/versions?vault=${encodeURIComponent("竞赛")}`);
+    const versions = (await listed.json() as VersionListResponse).versions;
+    assert.equal(versions.find((version) => version.versionId === first.deltaId)?.sealed, true);
+    assert.equal(versions.find((version) => version.versionId === first.deltaId)?.foldedInto, checkpointId);
+    const rogue = versions.find((version) => version.versionId === rogueId);
+    assert.equal(rogue?.sealed, false);
+    assert.equal(rogue?.tipRev, 99);
+    const rogueUrl = await authed(app, token, "POST", `/api/v1/files/${FILE}/version-urls`, {
+      vault: vaultId,
+      versionIds: [rogueId],
+    });
+    assert.equal(rogueUrl.status, 200, await rogueUrl.clone().text());
+    const folded = await authed(app, token, "POST", `/api/v1/files/${FILE}/version-urls`, {
+      vault: vaultId,
+      versionIds: [first.deltaId],
+    });
+    assert.equal(folded.status, 404);
+
+    const moved = await authed(app, token, "PUT", `/api/v1/objects/${FILE}`, plainObject("竞赛", "e6".repeat(32), "after", tipBody.rev, {
+      syncTrigger: "auto",
+      historyKind: "delta",
+      patchCipher: plainPatch("after-move"),
+    }));
+    assert.equal(moved.status, 200, await moved.clone().text());
+    const movedDelta = (await moved.json() as { versionId: string; rev: number }).versionId;
+    const stale = await authed(app, token, "POST", `/api/v1/files/${FILE}/checkpoints`, {
+      vault: vaultId,
+      contentCipher: tipBody.contentCipher,
+      contentMac: tipBody.contentMac,
+      size: tipBody.size,
+      mtime: tipBody.mtime,
+      encoding: tipBody.encoding,
+      tipRev: tipBody.rev,
+      syncTrigger: "auto",
+    });
+    assert.equal(stale.status, 409);
+    assert.equal((await stale.json() as ConflictBody).reason, "parent_rev");
+
+    await assert.rejects(
+      () => db.finishCheckpoint({
+        ...open,
+        versionId: "77".repeat(32),
+        tipRev: tipBody.rev,
+        contentMac: tipBody.contentMac,
+        kind: "checkpoint",
+        sealed: false,
+        foldedInto: "",
+        patchBytes: 0,
+      }, 100),
+      (error: unknown) => error instanceof TipMovedError,
+    );
+    const still = await db.findFileVersion(accountId, movedDelta);
+    assert.equal(still?.sealed, false);
+    assert.equal(still?.tipRev, tipBody.rev + 1);
+    const stillRogue = await db.findFileVersion(accountId, rogueId);
+    assert.equal(stillRogue?.sealed, false);
+    assert.equal(await db.getPatch(accountId, movedDelta), JSON.stringify(plainPatch("after-move")));
+  } finally {
+    await db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+async function putDelta(
+  app: ReturnType<typeof createApp>,
+  token: string,
+  fileId: string,
+  vault: string,
+  macByte: string,
+): Promise<{ deltaId: string; rev: number }> {
+  const created = await authed(app, token, "PUT", `/api/v1/objects/${fileId}`, plainObject(vault, `${macByte}a`.repeat(32).slice(0, 64), "base", null, {
+    syncTrigger: "auto",
+  }));
+  assert.equal(created.status, 200, await created.clone().text());
+  const parent = (await created.json() as { rev: number }).rev;
+  const delta = await authed(app, token, "PUT", `/api/v1/objects/${fileId}`, plainObject(vault, `${macByte}b`.repeat(32).slice(0, 64), "edit", parent, {
+    syncTrigger: "auto",
+    historyKind: "delta",
+    patchCipher: plainPatch(`${macByte}-patch`),
+  }));
+  assert.equal(delta.status, 200, await delta.clone().text());
+  const body = await delta.json() as { versionId: string; rev: number; historyKind: string; flush: { due: boolean } };
+  assert.equal(body.historyKind, "delta");
+  assert.equal(body.flush.due, false);
+  return { deltaId: body.versionId, rev: body.rev };
+}
+
+function accountIdIn(dir: string): string {
+  const names = readdirSync(join(dir, "blobs"));
+  const account = names[0];
+  if (!account) throw new Error("no account blob directory");
+  return account;
+}
 
 function listHistoryFiles(dir: string): string[] {
   const root = join(dir, "blobs");

@@ -526,7 +526,7 @@ async function flushDueCheckpoints(
 ): Promise<void> {
   let due: { files?: { fileId: string }[] };
   try {
-    due = await ready.client.historyFlush(ready.vaultId);
+    due = await ready.client.historyFlush(ready.vaultId, ready.syncTrigger);
   } catch (error) {
     console.warn("Could not list history checkpoints that are due", error);
     return;
@@ -552,7 +552,7 @@ async function flushDueCheckpoints(
         size: plain.byteLength,
         mtime: entry.mtime,
         encoding,
-      });
+      }, ready.syncTrigger);
     } catch (error) {
       console.warn("Could not checkpoint an aged history window", error);
     }

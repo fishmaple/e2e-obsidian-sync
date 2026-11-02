@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   autoVersionsToDrop,
   evaluateFlush,
+  flushReasonForSync,
   FLUSH_DELTA_AGE_MS,
   FLUSH_DELTA_BYTES,
   FLUSH_DELTA_COUNT,
@@ -104,6 +105,18 @@ test("flush fires on count, bytes, or one day, and manual forces it", () => {
 
   assert.equal(evaluateFlush([], now, "manual").reason, "manual");
   assert.equal(evaluateFlush([], now, "restore").due, true);
+});
+
+test("manual sync flushes every open delta and auto sync keeps the thresholds", () => {
+  const now = 1_700_000_000_000;
+  const small = { size: 20, patchBytes: 8, createdAt: now - 1000 };
+  assert.equal(flushReasonForSync([small], now, "auto").due, false);
+  const manual = flushReasonForSync([small], now, "manual");
+  assert.equal(manual.due, true);
+  assert.equal(manual.reason, "manual");
+  assert.equal(flushReasonForSync([], now, "manual").due, false);
+  assert.equal(flushReasonForSync([{ size: 10, patchBytes: 4, createdAt: now - FLUSH_DELTA_AGE_MS }], now, "auto").reason, "age");
+  assert.equal(flushReasonForSync(Array.from({ length: FLUSH_DELTA_COUNT }, () => small), now, "auto").reason, "count");
 });
 
 test("history writes are deltas only for an auto edit with a usable patch", () => {

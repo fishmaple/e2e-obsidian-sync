@@ -3,7 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { Hono, type Context } from "hono";
 import { bytesToBase64Url, randomBytes } from "../../shared/src/codec";
-import { evaluateFlush } from "../../shared/src/history";
+import { flushReasonForSync } from "../../shared/src/history";
 import {
   DEVICE_TTL_MS,
   MAX_BODY_BYTES,
@@ -15,7 +15,7 @@ import {
   type RemoteFile,
 } from "../../shared/src/protocol";
 import type { AppConfig } from "./config";
-import type { ObjectRow, SyncDb } from "./db";
+import { TipMovedError, type ObjectRow, type SyncDb } from "./db";
 import { HttpError } from "./http-error";
 import { accessPage, accountPage, homePage, installPage, installPs1, installSh, loginPage, messagePage, obsidianReturnPage } from "./html";
 import { createBlobStore } from "./storage";
@@ -712,14 +712,26 @@ export function createApp(deps: AppDeps): Hono {
       }, 409);
     }
     const retained = await retentionFor(db, accountId, fileId);
-    const history = await storeUploadedCheckpoint(
-      db,
-      blobs,
-      tip,
-      upload.syncTrigger,
-      JSON.stringify(upload.contentCipher),
-      retained.autoLimit,
-    );
+    let history;
+    try {
+      history = await storeUploadedCheckpoint(
+        db,
+        blobs,
+        tip,
+        upload.syncTrigger,
+        JSON.stringify(upload.contentCipher),
+        retained.autoLimit,
+      );
+    } catch (error) {
+      if (error instanceof TipMovedError) {
+        return c.json({
+          error: "The remote copy changed since this device last synced",
+          reason: "parent_rev",
+          file: error.current ? toRemoteFile(error.current) : null,
+        }, 409);
+      }
+      throw error;
+    }
     await forgetVersionBlobs(blobs, accountId, history.droppedVersionIds);
     return c.json({
       ok: true,
@@ -737,6 +749,7 @@ export function createApp(deps: AppDeps): Hono {
     if (!/^[0-9a-f-]{36}$/i.test(vaultId)) throw new HttpError(400, "Invalid vault id");
     const vault = await db.findVaultById(accountId, vaultId);
     if (!vault) throw new HttpError(404, "The remote vault does not exist");
+    const trigger = parseFlushTrigger(c.req.query("syncTrigger") ?? c.req.query("sync_trigger"));
     const grouped = new Map<string, { size: number; patchBytes: number; createdAt: number }[]>();
     for (const row of await db.listUnsealedDeltas(accountId, vault.name)) {
       const list = grouped.get(row.fileId);
@@ -752,8 +765,9 @@ export function createApp(deps: AppDeps): Hono {
       reason: string;
     }[] = [];
     const now = Date.now();
+    const limit = trigger === "manual" ? 20000 : 100;
     for (const [fileId, pending] of grouped) {
-      const flush = evaluateFlush(pending, now);
+      const flush = flushReasonForSync(pending, now, trigger);
       if (!flush.due || !flush.reason) continue;
       files.push({
         fileId,
@@ -762,7 +776,7 @@ export function createApp(deps: AppDeps): Hono {
         earliest: flush.earliest,
         reason: flush.reason,
       });
-      if (files.length >= 100) break;
+      if (files.length >= limit) break;
     }
     return c.json({ files });
   });
@@ -1028,6 +1042,12 @@ function parseLimit(value: string | undefined): number {
   const limit = Number(value);
   if (!Number.isSafeInteger(limit) || limit < 1) throw new HttpError(400, "Invalid changes limit");
   return Math.min(5000, limit);
+}
+
+function parseFlushTrigger(value: string | undefined): "auto" | "manual" {
+  if (value === undefined || value === "" || value === "auto") return "auto";
+  if (value === "manual") return "manual";
+  throw new HttpError(400, "Invalid sync trigger");
 }
 
 function parseVaultName(value: string | undefined): string {

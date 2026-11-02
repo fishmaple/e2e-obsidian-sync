@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { bytesToBase64Url, randomBytes } from "../../shared/src/codec";
-import { emptyFlush, historyVersionsToDrop, type FlushWindow, type SyncTrigger, type VersionKind } from "../../shared/src/history";
+import { emptyFlush, evaluateFlush, historyVersionsToDrop, type FlushWindow, type SyncTrigger, type VersionKind } from "../../shared/src/history";
 import type { AppConfig } from "./config";
 import { openMysql, openPostgres, openSqlite, type Queryable } from "./sql";
 
@@ -47,6 +47,17 @@ export interface HistoryWriteResult {
 
 export function noHistory(): HistoryWriteResult {
   return { droppedVersionIds: [], versionId: null, historyKind: null, flush: emptyFlush() };
+}
+
+/** The tip moved after a checkpoint body was chosen. The checkpoint transaction rolls back. */
+export class TipMovedError extends Error {
+  readonly current: ObjectRow | null;
+
+  constructor(current: ObjectRow | null) {
+    super("The remote copy changed since this device last synced");
+    this.name = "TipMovedError";
+    this.current = current;
+  }
 }
 
 export type PutRevisionResult =
@@ -870,17 +881,21 @@ export class SyncDb {
     }));
   }
 
-  /** Fold every open delta for this file into a checkpoint and delete patch bodies. */
-  async sealPendingDeltas(accountId: string, fileId: string, checkpointId: string): Promise<void> {
+  /**
+   * Fold open deltas into a checkpoint and delete their patch bodies.
+   * Deltas for a newer tip stay open so a checkpoint of an older revision cannot
+   * erase the patches needed to rebuild later edits.
+   */
+  async sealPendingDeltas(accountId: string, fileId: string, checkpointId: string, tipRev: number): Promise<void> {
     const rows = await this.sql.all<{ version_id: string }>(`
       SELECT version_id FROM file_versions
-      WHERE account_id = ? AND file_id = ? AND kind = 'delta' AND sealed = 0
-    `, [accountId, fileId]);
+      WHERE account_id = ? AND file_id = ? AND kind = 'delta' AND sealed = 0 AND tip_rev <= ?
+    `, [accountId, fileId, tipRev]);
     if (rows.length === 0) return;
     await this.sql.run(`
       UPDATE file_versions SET sealed = 1, folded_into = ?
-      WHERE account_id = ? AND file_id = ? AND kind = 'delta' AND sealed = 0
-    `, [checkpointId, accountId, fileId]);
+      WHERE account_id = ? AND file_id = ? AND kind = 'delta' AND sealed = 0 AND tip_rev <= ?
+    `, [checkpointId, accountId, fileId, tipRev]);
     for (const row of rows) await this.deletePatch(accountId, row.version_id);
   }
 
@@ -919,19 +934,28 @@ export class SyncDb {
   }
 
   async finishCheckpoint(row: FileVersionRow, autoLimit: number): Promise<HistoryWriteResult> {
-    await this.sql.exec("BEGIN");
+    await this.beginWrite();
     try {
+      const tip = await this.lockTip(row.accountId, row.fileId);
+      if (!tip || tip.rev !== row.tipRev || tip.contentMac !== row.contentMac || tip.encoding !== row.encoding) {
+        throw new TipMovedError(tip ?? null);
+      }
       const latest = await this.latestFileVersion(row.accountId, row.fileId);
       if (latest && latest.kind === "checkpoint" && latest.tipRev === row.tipRev && latest.contentMac === row.contentMac) {
-        await this.sealPendingDeltas(row.accountId, row.fileId, latest.versionId);
+        await this.sealPendingDeltas(row.accountId, row.fileId, latest.versionId, latest.tipRev);
+        const flush = evaluateFlush(await this.listPendingDeltaStats(row.accountId, row.fileId), Date.now());
         await this.sql.exec("COMMIT");
-        return { droppedVersionIds: [], versionId: latest.versionId, historyKind: "checkpoint", flush: emptyFlush() };
+        return { droppedVersionIds: [], versionId: latest.versionId, historyKind: "checkpoint", flush };
       }
-      const stored = await this.insertFileVersion(row);
-      await this.sealPendingDeltas(row.accountId, row.fileId, stored.versionId);
+      const stored = await this.insertFileVersion({
+        ...row,
+        baseVersionId: latest?.versionId ?? row.baseVersionId,
+      });
+      await this.sealPendingDeltas(row.accountId, row.fileId, stored.versionId, stored.tipRev);
       const droppedVersionIds = await this.dropExcessHistory(row.accountId, row.fileId, autoLimit);
+      const flush = evaluateFlush(await this.listPendingDeltaStats(row.accountId, row.fileId), Date.now());
       await this.sql.exec("COMMIT");
-      return { droppedVersionIds, versionId: stored.versionId, historyKind: "checkpoint", flush: emptyFlush() };
+      return { droppedVersionIds, versionId: stored.versionId, historyKind: "checkpoint", flush };
     } catch (error) {
       try {
         await this.sql.exec("ROLLBACK");
@@ -940,6 +964,20 @@ export class SyncDb {
       }
       throw error;
     }
+  }
+
+  private async beginWrite(): Promise<void> {
+    if (this.sql.dialect === "sqlite") await this.sql.exec("BEGIN IMMEDIATE");
+    else await this.sql.exec("BEGIN");
+  }
+
+  /** Read the tip and, on Postgres and MySQL, hold a row lock until commit. */
+  private async lockTip(accountId: string, fileId: string): Promise<ObjectRow | undefined> {
+    if (this.sql.dialect === "sqlite") return this.findObject(accountId, fileId);
+    const row = await this.sql.get<ObjectSqlRow>(`
+      SELECT ${OBJECT_COLUMNS} FROM objects WHERE account_id = ? AND file_id = ? FOR UPDATE
+    `, [accountId, fileId]);
+    return row ? mapObject(row) : undefined;
   }
 
   async deletePlaintextVersions(accountId: string, vaultName: string): Promise<string[]> {

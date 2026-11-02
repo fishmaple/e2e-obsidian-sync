@@ -137,8 +137,9 @@ export function emptyFlush(): FlushWindow {
 /**
  * Pending window for one file. `size` is the plaintext byte length stored on
  * the delta (the same field the day list sums). Patch body bytes also count,
- * so one huge patch cannot sit in the database. Manual and restore force a
- * checkpoint even when the window is empty.
+ * so one huge patch cannot sit in the database.
+ * `force` marks the window due even when it is empty; callers that list files
+ * should use `flushReasonForSync`, which forces manual only when a delta is open.
  */
 export function evaluateFlush(
   pending: readonly PendingDeltaStat[],
@@ -167,6 +168,20 @@ export function evaluateFlush(
   }
   if (earliest !== null && now - earliest >= FLUSH_DELTA_AGE_MS) return { ...window, due: true, reason: "age" };
   return window;
+}
+
+/**
+ * Auto sync uses the count, byte, and age thresholds.
+ * A manual sync checkpoints every file that still has an unsealed delta.
+ * An empty window is not due, so a manual sync does not rewrite files with no pending history.
+ */
+export function flushReasonForSync(
+  pending: readonly PendingDeltaStat[],
+  now: number,
+  syncTrigger: SyncTrigger,
+): FlushWindow {
+  if (syncTrigger === "manual" && pending.length > 0) return evaluateFlush(pending, now, "manual");
+  return evaluateFlush(pending, now);
 }
 
 /**

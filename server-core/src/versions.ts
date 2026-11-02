@@ -3,7 +3,6 @@ import {
   AUTO_VERSION_LIMIT_DEFAULT,
   AUTO_VERSION_LIMIT_MAX,
   AUTO_VERSION_LIMIT_MIN,
-  emptyFlush,
   evaluateFlush,
   retentionView,
   type FileVersionInfo,
@@ -204,15 +203,6 @@ export async function storeUploadedCheckpoint(
   autoLimit: number,
 ): Promise<HistoryWriteResult> {
   const latest = await db.latestFileVersion(row.accountId, row.fileId);
-  if (latest && latest.kind === "checkpoint" && latest.tipRev === row.rev && latest.contentMac === row.contentMac) {
-    await db.sealPendingDeltas(row.accountId, row.fileId, latest.versionId);
-    return {
-      droppedVersionIds: [],
-      versionId: latest.versionId,
-      historyKind: "checkpoint",
-      flush: evaluateFlush(await db.listPendingDeltaStats(row.accountId, row.fileId), Date.now()),
-    };
-  }
   const versionId = bytesToHex(randomBytes(32));
   await blobs.putVersion(row.accountId, versionId, body);
   try {
@@ -331,9 +321,14 @@ async function writeCheckpointFromTip(
     foldedInto: "",
     patchBytes: 0,
   });
-  await db.sealPendingDeltas(row.accountId, row.fileId, versionId);
+  await db.sealPendingDeltas(row.accountId, row.fileId, versionId, row.rev);
   const droppedVersionIds = await db.dropExcessHistory(row.accountId, row.fileId, autoLimit);
-  return { droppedVersionIds, versionId, historyKind: "checkpoint", flush: emptyFlush() };
+  return {
+    droppedVersionIds,
+    versionId,
+    historyKind: "checkpoint",
+    flush: evaluateFlush(await db.listPendingDeltaStats(row.accountId, row.fileId), Date.now()),
+  };
 }
 
 async function rememberLimits(db: SyncDb, accountId: string, fileId: string, options: HistoryWriteOptions): Promise<number> {

@@ -190,8 +190,12 @@ export class SyncClient {
     };
   }
 
-  historyFlush(vaultId: string): Promise<{ files: { fileId: string; pendingCount: number; pendingBytes: number; earliest: number | null; reason: string }[] }> {
-    return this.authed("GET", `/api/v1/vaults/${encodeURIComponent(vaultId)}/history-flush`);
+  historyFlush(
+    vaultId: string,
+    syncTrigger: SyncTrigger = "auto",
+  ): Promise<{ files: { fileId: string; pendingCount: number; pendingBytes: number; earliest: number | null; reason: string }[] }> {
+    const query = syncTrigger === "manual" ? "?syncTrigger=manual" : "";
+    return this.authed("GET", `/api/v1/vaults/${encodeURIComponent(vaultId)}/history-flush${query}`);
   }
 
   async getObject(fileId: string, vaultId: string): Promise<ObjectPayload> {
