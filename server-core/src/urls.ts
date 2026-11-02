@@ -1,5 +1,5 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
-import type { VersionDownload } from "../../shared/src/history";
+import type { VersionDownload, VersionKind } from "../../shared/src/history";
 import {
   MAX_BODY_BYTES,
   type DownloadUrl,
@@ -100,7 +100,11 @@ export async function listVersionDownloads(input: {
     if (!row || row.fileId !== input.fileId || row.vaultName !== input.vaultName) {
       throw new HttpError(404, "This version is not on the server");
     }
-    const link = await versionDownloadLink(input.config, input.db, input.accountId, versionId, input.origin, now);
+    if (row.kind === "delta") {
+      const patch = await input.db.getPatch(input.accountId, versionId);
+      if (!patch) throw new HttpError(404, "This version was folded into a checkpoint");
+    }
+    const link = await versionDownloadLink(input.config, input.db, input.accountId, versionId, input.origin, now, row.kind);
     downloads.push({
       fileId: row.fileId,
       versionId: row.versionId,
@@ -114,6 +118,10 @@ export async function listVersionDownloads(input: {
       encoding: row.encoding,
       tipRev: row.tipRev,
       syncTrigger: row.syncTrigger,
+      kind: row.kind,
+      baseVersionId: row.baseVersionId,
+      sealed: row.sealed,
+      foldedInto: row.foldedInto,
     });
   }
   return downloads;
@@ -278,8 +286,16 @@ async function versionDownloadLink(
   versionId: string,
   origin: string,
   now: number,
+  kind: VersionKind,
 ): Promise<{ url: string; expiresAt: number }> {
   const exp = now + URL_TTL_MS;
+  if (kind === "delta") {
+    const sig = versionSignature(config.sessionSecret, "GET", accountId, versionId, exp);
+    return {
+      url: `${origin}/api/v1/direct-version/${accountId}/${versionId}?exp=${exp}&sig=${sig}`,
+      expiresAt: exp,
+    };
+  }
   const inline = await db.getVersionBlob(accountId, versionId);
   const onR2 = config.storage.kind === "r2" && (inline === undefined || storedBytes(inline) >= config.storage.inlineMaxBytes);
   if (onR2) {

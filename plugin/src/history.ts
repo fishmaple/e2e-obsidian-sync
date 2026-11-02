@@ -1,15 +1,19 @@
 import { Modal, Notice, TFile, type App } from "obsidian";
-import { fileIdForPath, openBytes, plainFileId } from "../../shared/src/crypto";
+import { bytesToBase64 } from "../../shared/src/codec";
+import { contentMac, fileIdForPath, openBytes, plainFileId, plainMac, sealBytes } from "../../shared/src/crypto";
 import {
   clampAutoVersionLimit,
   diffVersionText,
   groupVersionsByDay,
   previousChangedDayPair,
+  reconstructPlan,
   type FileVersionInfo,
   type RetentionView,
   type TextDiffLine,
   type VersionDayGroup,
 } from "../../shared/src/history";
+import { applyPatch, bodyAad, patchAad } from "../../shared/src/patch";
+import type { PayloadCipher } from "../../shared/src/protocol";
 import { SyncClient, SyncConflictError, resolveSyncHost } from "./client";
 import { t } from "./i18n";
 import type E2eeSyncPlugin from "./main";
@@ -24,6 +28,7 @@ export class FileHistoryModal extends Modal {
   private expanded = new Set<string>();
   private client: SyncClient | null = null;
   private vaultId = "";
+  private vaultName = "";
   private keys: Awaited<ReturnType<typeof openBoundClient>>["keys"] = null;
 
   constructor(app: App, private readonly plugin: E2eeSyncPlugin) {
@@ -50,6 +55,7 @@ export class FileHistoryModal extends Modal {
       const ready = await openBoundClient(this.plugin, "manual");
       this.client = ready.client;
       this.vaultId = ready.vaultId;
+      this.vaultName = ready.vaultName;
       this.keys = ready.keys;
       this.fileId = ready.keys
         ? await fileIdForPath(ready.keys.idKey, file.path, ready.vaultName)
@@ -234,12 +240,29 @@ export class FileHistoryModal extends Modal {
   private async restore(version: FileVersionInfo): Promise<void> {
     if (!this.client) return;
     try {
-      const parentRev = await this.client.tipRevision(this.fileId, this.vaultId);
-      const result = await this.client.restoreVersion(this.fileId, version.versionId, this.vaultId, parentRev);
       const bytes = await this.plainBytes(version);
+      const parentRev = await this.client.tipRevision(this.fileId, this.vaultId);
+      const mac = this.keys ? await contentMac(this.keys.idKey, bytes) : await plainMac(bytes);
+      const contentCipher = this.keys
+        ? await sealBytes(this.keys.encKey, bytes, bodyAad(this.fileId), true)
+        : { v: 0 as const, raw: bytesToBase64(bytes) };
+      const pathCipher = this.keys
+        ? await sealBytes(this.keys.encKey, new TextEncoder().encode(this.filePath), `path:${this.fileId}`, true)
+        : { v: 0 as const, raw: bytesToBase64(new TextEncoder().encode(this.filePath)) };
+      const result = await this.client.putObject(this.fileId, {
+        vault: this.vaultName,
+        vaultId: this.vaultId,
+        pathCipher,
+        contentCipher,
+        contentMac: mac,
+        size: bytes.byteLength,
+        mtime: version.mtime,
+        encoding: this.keys ? "e2ee" : "plain",
+        parentRev,
+      }, { syncTrigger: "restore", historyKind: "checkpoint" });
       await applyRestoredFile(this.plugin, this.fileId, this.filePath, bytes, {
         mtime: version.mtime,
-        contentMac: result.contentMac || version.contentMac,
+        contentMac: result.contentMac || mac,
         encoding: result.encoding,
         rev: result.rev,
       });
@@ -267,11 +290,37 @@ export class FileHistoryModal extends Modal {
 
   private async plainBytes(version: FileVersionInfo): Promise<Uint8Array> {
     if (!this.client) throw new Error(t("historyFailed"));
-    const listed = await this.client.versionDownloads(this.fileId, this.vaultId, [version.versionId]);
+    const plan = reconstructPlan(this.versions, version.versionId);
+    if (plan.mode === "missing") throw new Error(t("historyFailed"));
+    if (plan.mode === "sealed") throw new Error(t("historySealed"));
+    let bytes: Uint8Array;
+    if (plan.mode === "full") {
+      bytes = await this.openBody(plan.versionId);
+    } else {
+      bytes = await this.openBody(plan.checkpointId);
+      for (const versionId of plan.deltaIds) {
+        bytes = applyPatch(bytes, await this.openPatch(versionId));
+      }
+    }
+    const mac = this.keys ? await contentMac(this.keys.idKey, bytes) : await plainMac(bytes);
+    if (mac !== version.contentMac) throw new Error(t("historyFailed"));
+    return bytes;
+  }
+
+  private async openBody(versionId: string): Promise<Uint8Array> {
+    return openBytes(this.keys?.encKey ?? null, await this.fetchVersion(versionId), bodyAad(this.fileId));
+  }
+
+  private async openPatch(versionId: string): Promise<Uint8Array> {
+    return openBytes(this.keys?.encKey ?? null, await this.fetchVersion(versionId), patchAad(this.fileId));
+  }
+
+  private async fetchVersion(versionId: string): Promise<PayloadCipher> {
+    if (!this.client) throw new Error(t("historyFailed"));
+    const listed = await this.client.versionDownloads(this.fileId, this.vaultId, [versionId]);
     const item = listed.downloads[0];
     if (!item) throw new Error(t("historyFailed"));
-    const cipher = await this.client.fetchCipher(item.url);
-    return openBytes(this.keys?.encKey ?? null, cipher, `body:${this.fileId}`);
+    return this.client.fetchCipher(item.url);
   }
 }
 
@@ -312,8 +361,9 @@ function versionLabel(version: FileVersionInfo): string {
   const trigger = version.syncTrigger === "manual"
     ? t("historyManual")
     : version.syncTrigger === "restore" ? t("historyRestoreTrigger") : t("historyAuto");
+  const kind = version.kind === "delta" ? t("historyDelta") : t("historyCheckpoint");
   const encoding = version.encoding === "plain" ? t("historyPlain") : t("historyEncrypted");
-  return `${clock(version.createdAt)} · ${trigger} · ${encoding} · ${formatBytes(version.size)} · rev ${version.tipRev}`;
+  return `${clock(version.createdAt)} · ${trigger} · ${kind} · ${encoding} · ${formatBytes(version.size)} · rev ${version.tipRev}`;
 }
 
 function clock(ms: number): string {

@@ -1,8 +1,9 @@
 import { FileSystemAdapter, Modal, Notice, TFile, type App, type Vault } from "obsidian";
 import { bytesToBase64, randomBytes } from "../../shared/src/codec";
 import { contentMac, deriveKeys, fileIdForPath, openBytes, plainFileId, plainMac, sealBytes } from "../../shared/src/crypto";
-import { clampAutoVersionLimit } from "../../shared/src/history";
-import { MAX_FILE_BYTES, MIN_SECRET_LENGTH, remoteRev, type ChangeEntry, type Encoding, type PutResult, type RemoteFile, type VaultStat } from "../../shared/src/protocol";
+import { clampAutoVersionLimit, planHistoryKind, type SyncTrigger } from "../../shared/src/history";
+import { bodyAad, diffBytes, patchAad } from "../../shared/src/patch";
+import { MAX_FILE_BYTES, MIN_SECRET_LENGTH, remoteRev, type ChangeEntry, type Encoding, type PayloadCipher, type PutResult, type RemoteFile, type VaultStat } from "../../shared/src/protocol";
 import { decideSyncAction } from "../../shared/src/reconcile";
 import { SyncClient, SyncConflictError, fetchBootstrap, openExternal, resolveSyncHost } from "./client";
 import { askConflict, type ConflictChoice, type ConflictView } from "./conflict";
@@ -288,6 +289,8 @@ export async function pushVault(plugin: E2eeSyncPlugin, trigger: "auto" | "manua
   }
   if (unresolved > 0) deferCursor = true;
 
+  await flushDueCheckpoints(plugin, ready, index);
+
   plugin.settings.index = index;
   if (!deferCursor && loaded.cursor !== null) plugin.settings.changeCursor = loaded.cursor;
   const large = skippedLarge.length ? t("large", { n: skippedLarge.length }) : "";
@@ -436,24 +439,124 @@ async function putFile(
   mtime: number,
   parentRev: number | null,
 ): Promise<PutResult> {
-  return ready.client.putObject(fileId, {
+  const contentCipher = ready.keys
+    ? await sealBytes(ready.keys.encKey, plain, bodyAad(fileId), true)
+    : { v: 0 as const, raw: bytesToBase64(plain) };
+  const history = await historyUpload(ready, fileId, plain, parentRev);
+  const result = await ready.client.putObject(fileId, {
     vault: ready.vaultName,
     vaultId: ready.vaultId,
     pathCipher: ready.keys
       ? await sealBytes(ready.keys.encKey, new TextEncoder().encode(path), `path:${fileId}`, true)
       : { v: 0, raw: bytesToBase64(new TextEncoder().encode(path)) },
-    contentCipher: ready.keys
-      ? await sealBytes(ready.keys.encKey, plain, `body:${fileId}`, true)
-      : { v: 0, raw: bytesToBase64(plain) },
+    contentCipher,
     contentMac: mac,
     size: plain.byteLength,
     mtime,
     encoding,
     parentRev,
-  }, {
-    syncTrigger: ready.syncTrigger,
-    autoLimit: ready.autoLimitFor(fileId),
-  });
+  }, history);
+  if (history.historyKind === "delta" && result.historyKind !== "checkpoint" && result.flush?.due && result.rev > 0) {
+    await storeCheckpoint(ready, fileId, contentCipher, {
+      rev: result.rev,
+      contentMac: result.contentMac,
+      size: result.size,
+      mtime: result.mtime,
+      encoding: result.encoding,
+    });
+  }
+  return result;
+}
+
+async function historyUpload(
+  ready: ReadyClient,
+  fileId: string,
+  plain: Uint8Array,
+  parentRev: number | null,
+): Promise<{ syncTrigger: SyncTrigger; autoLimit: number; historyKind: "delta" | "checkpoint"; patchCipher?: PayloadCipher }> {
+  const syncTrigger = ready.syncTrigger;
+  const autoLimit = ready.autoLimitFor(fileId);
+  if (planHistoryKind({ syncTrigger, hasParent: parentRev !== null, patchBytes: parentRev === null ? null : 0 }) === "checkpoint") {
+    return { syncTrigger, autoLimit, historyKind: "checkpoint" };
+  }
+  try {
+    const base = await downloadPlain(ready, fileId);
+    const patch = diffBytes(base, plain);
+    if (planHistoryKind({ syncTrigger, hasParent: true, patchBytes: patch.byteLength }) !== "delta") {
+      return { syncTrigger, autoLimit, historyKind: "checkpoint" };
+    }
+    const patchCipher = ready.keys
+      ? await sealBytes(ready.keys.encKey, patch, patchAad(fileId), true)
+      : { v: 0 as const, raw: bytesToBase64(patch) };
+    return { syncTrigger, autoLimit, historyKind: "delta", patchCipher };
+  } catch (error) {
+    console.warn("History patch fell back to a checkpoint", error);
+    return { syncTrigger, autoLimit, historyKind: "checkpoint" };
+  }
+}
+
+async function storeCheckpoint(
+  ready: ReadyClient,
+  fileId: string,
+  contentCipher: PayloadCipher,
+  tip: { rev: number; contentMac: string; size: number; mtime: number; encoding: Encoding },
+  syncTrigger: SyncTrigger = "auto",
+): Promise<void> {
+  try {
+    await ready.client.putCheckpoint(fileId, {
+      vault: ready.vaultName,
+      vaultId: ready.vaultId,
+      contentCipher,
+      contentMac: tip.contentMac,
+      size: tip.size,
+      mtime: tip.mtime,
+      encoding: tip.encoding,
+      tipRev: tip.rev,
+      syncTrigger,
+    });
+  } catch (error) {
+    console.warn("Could not store a history checkpoint", error);
+  }
+}
+
+async function flushDueCheckpoints(
+  plugin: E2eeSyncPlugin,
+  ready: ReadyClient,
+  index: Record<string, FileIndexEntry>,
+): Promise<void> {
+  let due: { files?: { fileId: string }[] };
+  try {
+    due = await ready.client.historyFlush(ready.vaultId);
+  } catch (error) {
+    console.warn("Could not list history checkpoints that are due", error);
+    return;
+  }
+  for (const item of due.files ?? []) {
+    const entry = index[item.fileId];
+    if (!entry || typeof entry.rev !== "number" || entry.rev < 1) continue;
+    const file = plugin.app.vault.getAbstractFileByPath(entry.path);
+    if (!(file instanceof TFile)) continue;
+    try {
+      const plain = new Uint8Array(await plugin.app.vault.readBinary(file));
+      const mac = await fingerprint(ready, plain);
+      if (mac !== entry.contentMac) continue;
+      const encoding: Encoding = entry.encoding === "plain" || entry.encoding === "e2ee"
+        ? entry.encoding
+        : (ready.keys ? "e2ee" : "plain");
+      const contentCipher = ready.keys
+        ? await sealBytes(ready.keys.encKey, plain, bodyAad(item.fileId), true)
+        : { v: 0 as const, raw: bytesToBase64(plain) };
+      await storeCheckpoint(ready, item.fileId, contentCipher, {
+        rev: entry.rev,
+        contentMac: mac,
+        size: plain.byteLength,
+        mtime: entry.mtime,
+        encoding,
+      });
+    } catch (error) {
+      console.warn("Could not checkpoint an aged history window", error);
+    }
+  }
 }
 
 export async function applyRestoredFile(

@@ -2,6 +2,14 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   autoVersionsToDrop,
+  evaluateFlush,
+  FLUSH_DELTA_AGE_MS,
+  FLUSH_DELTA_BYTES,
+  FLUSH_DELTA_COUNT,
+  historyVersionsToDrop,
+  MAX_DELTA_PATCH_BYTES,
+  planHistoryKind,
+  reconstructPlan,
   diffVersionText,
   groupVersionsByDay,
   previousChangedDayPair,
@@ -70,6 +78,112 @@ test("auto retention drops only auto versions past the newest limit", () => {
   assert.deepEqual(autoVersionsToDrop(rows, 2), ["a1"]);
   assert.deepEqual(autoVersionsToDrop(rows, 100).length, 0);
   assert.deepEqual(autoVersionsToDrop(rows, 1), ["a2", "a1"]);
+});
+
+test("flush fires on count, bytes, or one day, and manual forces it", () => {
+  const now = 1_700_000_000_000;
+  const small = { size: 100, patchBytes: 40, createdAt: now - 1000 };
+  assert.equal(evaluateFlush([small], now).due, false);
+  assert.equal(evaluateFlush(Array.from({ length: FLUSH_DELTA_COUNT - 1 }, () => small), now).due, false);
+  const counted = evaluateFlush(Array.from({ length: FLUSH_DELTA_COUNT }, () => small), now);
+  assert.equal(counted.due, true);
+  assert.equal(counted.reason, "count");
+  assert.equal(counted.pendingBytes, FLUSH_DELTA_COUNT * 100);
+
+  const bulky = evaluateFlush([{ size: FLUSH_DELTA_BYTES, patchBytes: 10, createdAt: now }], now);
+  assert.equal(bulky.reason, "bytes");
+  const patchBulky = evaluateFlush([{ size: 10, patchBytes: FLUSH_DELTA_BYTES, createdAt: now }], now);
+  assert.equal(patchBulky.reason, "bytes");
+
+  const fresh = evaluateFlush([{ size: 10, patchBytes: 10, createdAt: now - FLUSH_DELTA_AGE_MS + 1 }], now);
+  assert.equal(fresh.due, false);
+  const aged = evaluateFlush([{ size: 10, patchBytes: 10, createdAt: now - FLUSH_DELTA_AGE_MS }], now);
+  assert.equal(aged.due, true);
+  assert.equal(aged.reason, "age");
+  assert.equal(aged.earliest, now - FLUSH_DELTA_AGE_MS);
+
+  assert.equal(evaluateFlush([], now, "manual").reason, "manual");
+  assert.equal(evaluateFlush([], now, "restore").due, true);
+});
+
+test("history writes are deltas only for an auto edit with a usable patch", () => {
+  assert.equal(planHistoryKind({ syncTrigger: "auto", hasParent: true, patchBytes: 20 }), "delta");
+  assert.equal(planHistoryKind({ syncTrigger: "manual", hasParent: true, patchBytes: 20 }), "checkpoint");
+  assert.equal(planHistoryKind({ syncTrigger: "restore", hasParent: true, patchBytes: 20 }), "checkpoint");
+  assert.equal(planHistoryKind({ syncTrigger: "auto", hasParent: false, patchBytes: 20 }), "checkpoint");
+  assert.equal(planHistoryKind({ syncTrigger: "auto", hasParent: true, patchBytes: null }), "checkpoint");
+  assert.equal(planHistoryKind({ syncTrigger: "auto", hasParent: true, patchBytes: MAX_DELTA_PATCH_BYTES + 1 }), "checkpoint");
+});
+
+test("retention drops old auto checkpoints and the sealed deltas folded into them", () => {
+  const rows = [
+    { versionId: "c1", createdAt: 1, syncTrigger: "auto" as const, kind: "checkpoint" as const },
+    { versionId: "d1", createdAt: 2, syncTrigger: "auto" as const, kind: "delta" as const, sealed: true, foldedInto: "c1" },
+    { versionId: "d2", createdAt: 3, syncTrigger: "auto" as const, kind: "delta" as const, sealed: false, foldedInto: "" },
+    { versionId: "c2", createdAt: 4, syncTrigger: "auto" as const, kind: "checkpoint" as const },
+    { versionId: "m1", createdAt: 5, syncTrigger: "manual" as const, kind: "checkpoint" as const },
+    { versionId: "r1", createdAt: 6, syncTrigger: "restore" as const, kind: "checkpoint" as const },
+  ];
+  assert.deepEqual(historyVersionsToDrop(rows, 1).sort(), ["c1", "d1"]);
+  assert.deepEqual(historyVersionsToDrop(rows, 2), []);
+});
+
+test("reconstruction walks a checkpoint plus open deltas and refuses a sealed gap", () => {
+  const fileId = "ab".repeat(32);
+  const mac = "cd".repeat(32);
+  const checkpoint = version({
+    versionId: "1".repeat(64),
+    createdAt: 1,
+    syncTrigger: "auto",
+    kind: "checkpoint",
+    contentMac: mac,
+    fileId,
+  });
+  const open = version({
+    versionId: "2".repeat(64),
+    createdAt: 2,
+    syncTrigger: "auto",
+    kind: "delta",
+    baseVersionId: checkpoint.versionId,
+    sealed: false,
+    contentMac: "ee".repeat(32),
+    fileId,
+  });
+  const sealed = version({
+    versionId: "3".repeat(64),
+    createdAt: 3,
+    syncTrigger: "auto",
+    kind: "delta",
+    baseVersionId: open.versionId,
+    sealed: true,
+    foldedInto: "4".repeat(64),
+    contentMac: "ff".repeat(32),
+    fileId,
+  });
+  const folded = version({
+    versionId: "4".repeat(64),
+    createdAt: 4,
+    syncTrigger: "auto",
+    kind: "checkpoint",
+    contentMac: mac,
+    fileId,
+  });
+  const sameMac = version({
+    ...sealed,
+    versionId: "5".repeat(64),
+    contentMac: mac,
+    foldedInto: folded.versionId,
+  });
+  const versions = [checkpoint, open, sealed, folded, sameMac];
+  assert.deepEqual(reconstructPlan(versions, checkpoint.versionId), { mode: "full", versionId: checkpoint.versionId });
+  assert.deepEqual(reconstructPlan(versions, open.versionId), {
+    mode: "chain",
+    checkpointId: checkpoint.versionId,
+    deltaIds: [open.versionId],
+  });
+  assert.deepEqual(reconstructPlan(versions, sealed.versionId), { mode: "sealed" });
+  assert.deepEqual(reconstructPlan(versions, sameMac.versionId), { mode: "full", versionId: folded.versionId });
+  assert.equal(reconstructPlan(versions, "0".repeat(64)).mode, "missing");
 });
 
 test("version text diff marks inserted and removed lines", () => {

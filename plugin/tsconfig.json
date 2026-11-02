@@ -13,6 +13,7 @@
     "src/**/*.ts",
     "../shared/src/codec.ts",
     "../shared/src/history.ts",
+    "../shared/src/patch.ts",
     "../shared/src/crypto.ts",
     "../shared/src/merge.ts",
     "../shared/src/protocol.ts",

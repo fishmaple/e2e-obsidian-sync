@@ -1,11 +1,20 @@
 import type { Encoding, PayloadCipher } from "./protocol";
 
-/** Auto versions kept per file when a file has no saved limit. */
+/** Auto checkpoints kept per file when a file has no saved limit. */
 export const AUTO_VERSION_LIMIT_DEFAULT = 100;
 export const AUTO_VERSION_LIMIT_MIN = 1;
 export const AUTO_VERSION_LIMIT_MAX = 256;
 
+/** Pending deltas that force a checkpoint. Count only autos that stored a delta. */
+export const FLUSH_DELTA_COUNT = 120;
+export const FLUSH_DELTA_BYTES = 1024 * 1024;
+export const FLUSH_DELTA_AGE_MS = 24 * 60 * 60 * 1000;
+/** Raw patch bytes above this are stored as a checkpoint so the commit body stays small. */
+export const MAX_DELTA_PATCH_BYTES = 6_000_000;
+
 export type SyncTrigger = "auto" | "manual" | "restore";
+export type VersionKind = "checkpoint" | "delta";
+export type FlushReason = "count" | "bytes" | "age" | "manual" | "restore";
 
 export interface FileVersionInfo {
   versionId: string;
@@ -17,6 +26,15 @@ export interface FileVersionInfo {
   tipRev: number;
   syncTrigger: SyncTrigger;
   contentMac: string;
+  /**
+   * Missing kind means a full checkpoint. Older servers only stored those.
+   * `sealed` deltas have had their patch body removed after a checkpoint.
+   */
+  kind?: VersionKind;
+  baseVersionId?: string;
+  sealed?: boolean;
+  foldedInto?: string;
+  patchBytes?: number;
 }
 
 /**
@@ -48,6 +66,10 @@ export interface VersionDownload {
   encoding: Encoding;
   tipRev: number;
   syncTrigger: SyncTrigger;
+  kind?: VersionKind;
+  baseVersionId?: string;
+  sealed?: boolean;
+  foldedInto?: string;
 }
 
 export interface VersionDayGroup {
@@ -70,9 +92,152 @@ export interface TextDiffLine {
 
 const DIFF_LINE_CAP = 1200;
 
+export interface PendingDeltaStat {
+  size: number;
+  patchBytes?: number;
+  createdAt: number;
+}
+
+export interface FlushWindow {
+  pendingCount: number;
+  pendingBytes: number;
+  earliest: number | null;
+  due: boolean;
+  reason: FlushReason | null;
+}
+
+export interface HistoryRetentionNode {
+  versionId: string;
+  createdAt: number;
+  syncTrigger: SyncTrigger;
+  kind?: VersionKind;
+  sealed?: boolean;
+  foldedInto?: string;
+}
+
+export type ReconstructPlan =
+  | { mode: "full"; versionId: string }
+  | { mode: "chain"; checkpointId: string; deltaIds: string[] }
+  | { mode: "sealed" }
+  | { mode: "missing" };
+
+export function versionKind(version: { kind?: VersionKind }): VersionKind {
+  return version.kind === "delta" ? "delta" : "checkpoint";
+}
+
 export function clampAutoVersionLimit(value: number): number {
   if (!Number.isFinite(value)) return AUTO_VERSION_LIMIT_DEFAULT;
   return Math.min(AUTO_VERSION_LIMIT_MAX, Math.max(AUTO_VERSION_LIMIT_MIN, Math.floor(value)));
+}
+
+export function emptyFlush(): FlushWindow {
+  return { pendingCount: 0, pendingBytes: 0, earliest: null, due: false, reason: null };
+}
+
+/**
+ * Pending window for one file. `size` is the plaintext byte length stored on
+ * the delta (the same field the day list sums). Patch body bytes also count,
+ * so one huge patch cannot sit in the database. Manual and restore force a
+ * checkpoint even when the window is empty.
+ */
+export function evaluateFlush(
+  pending: readonly PendingDeltaStat[],
+  now: number,
+  force?: "manual" | "restore" | null,
+): FlushWindow {
+  let pendingBytes = 0;
+  let patchBytes = 0;
+  let earliest: number | null = null;
+  for (const item of pending) {
+    pendingBytes += Number.isFinite(item.size) ? item.size : 0;
+    patchBytes += Number.isFinite(item.patchBytes) ? (item.patchBytes ?? 0) : 0;
+    if (earliest === null || item.createdAt < earliest) earliest = item.createdAt;
+  }
+  const window: FlushWindow = {
+    pendingCount: pending.length,
+    pendingBytes,
+    earliest,
+    due: false,
+    reason: null,
+  };
+  if (force === "manual" || force === "restore") return { ...window, due: true, reason: force };
+  if (pending.length >= FLUSH_DELTA_COUNT) return { ...window, due: true, reason: "count" };
+  if (pendingBytes >= FLUSH_DELTA_BYTES || patchBytes >= FLUSH_DELTA_BYTES) {
+    return { ...window, due: true, reason: "bytes" };
+  }
+  if (earliest !== null && now - earliest >= FLUSH_DELTA_AGE_MS) return { ...window, due: true, reason: "age" };
+  return window;
+}
+
+/**
+ * Auto sync of an existing file stores a delta. The first revision, manual
+ * sync, restore, and patches too large for the commit body are checkpoints.
+ */
+export function planHistoryKind(input: {
+  syncTrigger: SyncTrigger;
+  hasParent: boolean;
+  patchBytes: number | null;
+}): VersionKind {
+  if (input.syncTrigger !== "auto" || !input.hasParent || input.patchBytes === null) return "checkpoint";
+  if (input.patchBytes > MAX_DELTA_PATCH_BYTES) return "checkpoint";
+  return "delta";
+}
+
+/**
+ * Auto checkpoints past the newest `autoLimit` are dropped, together with
+ * sealed auto deltas that were folded into one of those checkpoints.
+ * Manual and restore rows are kept. Unsealed deltas are kept until a checkpoint
+ * seals them; they are the only copy of that edit.
+ */
+export function historyVersionsToDrop(versions: readonly HistoryRetentionNode[], autoLimit: number): string[] {
+  const keep = clampAutoVersionLimit(autoLimit);
+  const autoCheckpoints = versions
+    .filter((version) => versionKind(version) === "checkpoint" && version.syncTrigger === "auto")
+    .sort(byNewest);
+  const droppedCheckpoints = autoCheckpoints.slice(keep);
+  const droppedIds = new Set(droppedCheckpoints.map((version) => version.versionId));
+  const folded = versions.filter((version) =>
+    version.syncTrigger === "auto"
+    && versionKind(version) === "delta"
+    && version.sealed === true
+    && typeof version.foldedInto === "string"
+    && droppedIds.has(version.foldedInto),
+  );
+  return [...droppedCheckpoints, ...folded].map((version) => version.versionId);
+}
+
+/**
+ * How to rebuild one version on the client.
+ * A checkpoint is fetched whole. An open delta walks back to a checkpoint and
+ * applies patches. A sealed delta whose patch was deleted is readable only when
+ * some checkpoint still has the same content fingerprint.
+ */
+export function reconstructPlan(versions: readonly FileVersionInfo[], targetId: string): ReconstructPlan {
+  const byId = new Map(versions.map((version) => [version.versionId, version]));
+  const target = byId.get(targetId);
+  if (!target) return { mode: "missing" };
+  if (versionKind(target) === "checkpoint") return { mode: "full", versionId: target.versionId };
+  if (target.sealed) {
+    const folded = target.foldedInto ? byId.get(target.foldedInto) : undefined;
+    if (folded && versionKind(folded) === "checkpoint" && folded.contentMac === target.contentMac) {
+      return { mode: "full", versionId: folded.versionId };
+    }
+    const same = versions.find((version) => versionKind(version) === "checkpoint" && version.contentMac === target.contentMac);
+    if (same) return { mode: "full", versionId: same.versionId };
+    return { mode: "sealed" };
+  }
+  const chain: FileVersionInfo[] = [];
+  const seen = new Set<string>();
+  let cursor: FileVersionInfo | undefined = target;
+  while (cursor && versionKind(cursor) === "delta") {
+    if (seen.has(cursor.versionId) || cursor.sealed) return { mode: "sealed" };
+    seen.add(cursor.versionId);
+    chain.push(cursor);
+    cursor = cursor.baseVersionId ? byId.get(cursor.baseVersionId) : undefined;
+  }
+  if (!cursor || versionKind(cursor) !== "checkpoint") return { mode: "sealed" };
+  chain.reverse();
+  return { mode: "chain", checkpointId: cursor.versionId, deltaIds: chain.map((version) => version.versionId) };
 }
 
 export function retentionView(autoLimit: number, manualLimit: number | null): RetentionView {

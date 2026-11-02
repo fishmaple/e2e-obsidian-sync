@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { bytesToBase64Url, randomBytes } from "../../shared/src/codec";
-import { autoVersionsToDrop, type SyncTrigger } from "../../shared/src/history";
+import { emptyFlush, historyVersionsToDrop, type FlushWindow, type SyncTrigger, type VersionKind } from "../../shared/src/history";
 import type { AppConfig } from "./config";
 import { openMysql, openPostgres, openSqlite, type Queryable } from "./sql";
 
@@ -38,8 +38,19 @@ export interface ChangeRow {
   encoding: Encoding;
 }
 
+export interface HistoryWriteResult {
+  droppedVersionIds: string[];
+  versionId: string | null;
+  historyKind: VersionKind | null;
+  flush: FlushWindow;
+}
+
+export function noHistory(): HistoryWriteResult {
+  return { droppedVersionIds: [], versionId: null, historyKind: null, flush: emptyFlush() };
+}
+
 export type PutRevisionResult =
-  | { status: "created" | "updated" | "unchanged"; row: ObjectRow; droppedVersionIds: string[] }
+  | { status: "created" | "updated" | "unchanged"; row: ObjectRow; history: HistoryWriteResult }
   | { status: "conflict"; reason: "parent_rev" | "deleted"; current: ObjectRow | null };
 
 export interface FileVersionRow {
@@ -55,6 +66,11 @@ export interface FileVersionRow {
   encoding: Encoding;
   tipRev: number;
   syncTrigger: SyncTrigger;
+  kind: VersionKind;
+  baseVersionId: string;
+  sealed: boolean;
+  foldedInto: string;
+  patchBytes: number;
 }
 
 export interface RetentionRow {
@@ -111,7 +127,7 @@ interface ChangeSqlRow {
 }
 
 const OBJECT_COLUMNS = "account_id, file_id, vault_name, path_cipher, content_mac, size, mtime, updated_at, encoding, rev";
-const VERSION_COLUMNS = "account_id, version_id, file_id, vault_name, path_cipher, content_mac, size, mtime, created_at, encoding, tip_rev, sync_trigger";
+const VERSION_COLUMNS = "account_id, version_id, file_id, vault_name, path_cipher, content_mac, size, mtime, created_at, encoding, tip_rev, sync_trigger, kind, base_version_id, sealed, folded_into, patch_bytes";
 
 interface VersionSqlRow {
   account_id: string;
@@ -126,6 +142,11 @@ interface VersionSqlRow {
   encoding: string | null;
   tip_rev: number | string | null;
   sync_trigger: string | null;
+  kind: string | null;
+  base_version_id: string | null;
+  sealed: number | string | null;
+  folded_into: string | null;
+  patch_bytes: number | string | null;
 }
 
 export class SyncDb {
@@ -461,14 +482,14 @@ export class SyncDb {
     row: Omit<ObjectRow, "rev" | "updatedAt">,
     parentRev: number | null,
     writeBlob: () => Promise<void>,
-    recordVersion?: (row: ObjectRow) => Promise<string[]>,
+    recordVersion?: (row: ObjectRow) => Promise<HistoryWriteResult>,
   ): Promise<PutRevisionResult> {
     await this.sql.exec("BEGIN");
     try {
       const existing = await this.findObject(row.accountId, row.fileId);
       if (existing && existing.contentMac === row.contentMac && existing.encoding === row.encoding) {
         await this.sql.exec("COMMIT");
-        return { status: "unchanged", row: existing, droppedVersionIds: [] };
+        return { status: "unchanged", row: existing, history: noHistory() };
       }
       if (!existing) {
         if (parentRev !== null) {
@@ -479,9 +500,9 @@ export class SyncDb {
         await this.insertObject(created);
         await this.appendChange(created, "upsert");
         await writeBlob();
-        const droppedVersionIds = recordVersion ? await recordVersion(created) : [];
+        const history = recordVersion ? await recordVersion(created) : noHistory();
         await this.sql.exec("COMMIT");
-        return { status: "created", row: created, droppedVersionIds };
+        return { status: "created", row: created, history };
       }
       if (parentRev === null || parentRev !== existing.rev) {
         await this.sql.exec("COMMIT");
@@ -512,9 +533,9 @@ export class SyncDb {
       }
       await this.appendChange(updated, "upsert");
       await writeBlob();
-      const droppedVersionIds = recordVersion ? await recordVersion(updated) : [];
+      const history = recordVersion ? await recordVersion(updated) : noHistory();
       await this.sql.exec("COMMIT");
-      return { status: "updated", row: updated, droppedVersionIds };
+      return { status: "updated", row: updated, history };
     } catch (error) {
       try {
         await this.sql.exec("ROLLBACK");
@@ -639,6 +660,7 @@ export class SyncDb {
       for (const fileId of retentionIds) {
         await this.sql.run("DELETE FROM file_retention WHERE account_id = ? AND file_id = ?", [accountId, fileId]);
       }
+      for (const versionId of versionIds) await this.deletePatch(accountId, versionId);
       await this.sql.run("DELETE FROM file_versions WHERE account_id = ? AND vault_name = ?", [accountId, vault.name]);
       await this.sql.run("DELETE FROM objects WHERE account_id = ? AND vault_name = ?", [accountId, vault.name]);
       await this.sql.run("DELETE FROM changes WHERE account_id = ? AND vault_name = ?", [accountId, vault.name]);
@@ -728,8 +750,9 @@ export class SyncDb {
     await this.sql.run(`
       INSERT INTO file_versions (
         account_id, version_id, file_id, vault_name, path_cipher, content_mac,
-        size, mtime, created_at, encoding, tip_rev, sync_trigger
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        size, mtime, created_at, encoding, tip_rev, sync_trigger,
+        kind, base_version_id, sealed, folded_into, patch_bytes
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `, [
       stored.accountId,
       stored.versionId,
@@ -743,6 +766,11 @@ export class SyncDb {
       stored.encoding,
       stored.tipRev,
       stored.syncTrigger,
+      stored.kind,
+      stored.baseVersionId,
+      stored.sealed ? 1 : 0,
+      stored.foldedInto,
+      stored.patchBytes,
     ]);
     return stored;
   }
@@ -766,23 +794,152 @@ export class SyncDb {
     return rows.map(mapVersion);
   }
 
-  async dropExcessAutoVersions(accountId: string, fileId: string, autoLimit: number): Promise<string[]> {
-    const rows = await this.sql.all<{ version_id: string; created_at: number | string; sync_trigger: string }>(`
-      SELECT version_id, created_at, sync_trigger
+  async latestFileVersion(accountId: string, fileId: string): Promise<FileVersionRow | undefined> {
+    const row = await this.sql.get<VersionSqlRow>(`
+      SELECT ${VERSION_COLUMNS}
+      FROM file_versions
+      WHERE account_id = ? AND file_id = ?
+      ORDER BY created_at DESC, version_id DESC
+      LIMIT 1
+    `, [accountId, fileId]);
+    return row ? mapVersion(row) : undefined;
+  }
+
+  async hasCheckpoint(accountId: string, fileId: string): Promise<boolean> {
+    const row = await this.sql.get<{ version_id: string }>(`
+      SELECT version_id FROM file_versions
+      WHERE account_id = ? AND file_id = ? AND kind <> 'delta'
+      LIMIT 1
+    `, [accountId, fileId]);
+    return Boolean(row);
+  }
+
+  async putPatch(accountId: string, versionId: string, content: string): Promise<void> {
+    const existing = await this.sql.get<{ version_id: string }>(
+      "SELECT version_id FROM version_patches WHERE account_id = ? AND version_id = ?",
+      [accountId, versionId],
+    );
+    if (existing) {
+      await this.sql.run(
+        "UPDATE version_patches SET content = ? WHERE account_id = ? AND version_id = ?",
+        [content, accountId, versionId],
+      );
+      return;
+    }
+    await this.sql.run(
+      "INSERT INTO version_patches (account_id, version_id, content) VALUES (?, ?, ?)",
+      [accountId, versionId, content],
+    );
+  }
+
+  async getPatch(accountId: string, versionId: string): Promise<string | undefined> {
+    const row = await this.sql.get<{ content: string | Buffer }>(
+      "SELECT content FROM version_patches WHERE account_id = ? AND version_id = ?",
+      [accountId, versionId],
+    );
+    if (!row) return undefined;
+    return typeof row.content === "string" ? row.content : Buffer.from(row.content).toString("utf8");
+  }
+
+  async deletePatch(accountId: string, versionId: string): Promise<void> {
+    await this.sql.run("DELETE FROM version_patches WHERE account_id = ? AND version_id = ?", [accountId, versionId]);
+  }
+
+  async listPendingDeltaStats(accountId: string, fileId: string): Promise<{ size: number; patchBytes: number; createdAt: number }[]> {
+    const rows = await this.sql.all<{ size: number | string; patch_bytes: number | string | null; created_at: number | string }>(`
+      SELECT size, patch_bytes, created_at FROM file_versions
+      WHERE account_id = ? AND file_id = ? AND kind = 'delta' AND sealed = 0
+    `, [accountId, fileId]);
+    return rows.map((row) => ({
+      size: Number(row.size),
+      patchBytes: Number(row.patch_bytes ?? 0),
+      createdAt: Number(row.created_at),
+    }));
+  }
+
+  async listUnsealedDeltas(accountId: string, vaultName: string): Promise<{ fileId: string; size: number; patchBytes: number; createdAt: number }[]> {
+    const rows = await this.sql.all<{ file_id: string; size: number | string; patch_bytes: number | string | null; created_at: number | string }>(`
+      SELECT file_id, size, patch_bytes, created_at FROM file_versions
+      WHERE account_id = ? AND vault_name = ? AND kind = 'delta' AND sealed = 0
+    `, [accountId, vaultName]);
+    return rows.map((row) => ({
+      fileId: row.file_id,
+      size: Number(row.size),
+      patchBytes: Number(row.patch_bytes ?? 0),
+      createdAt: Number(row.created_at),
+    }));
+  }
+
+  /** Fold every open delta for this file into a checkpoint and delete patch bodies. */
+  async sealPendingDeltas(accountId: string, fileId: string, checkpointId: string): Promise<void> {
+    const rows = await this.sql.all<{ version_id: string }>(`
+      SELECT version_id FROM file_versions
+      WHERE account_id = ? AND file_id = ? AND kind = 'delta' AND sealed = 0
+    `, [accountId, fileId]);
+    if (rows.length === 0) return;
+    await this.sql.run(`
+      UPDATE file_versions SET sealed = 1, folded_into = ?
+      WHERE account_id = ? AND file_id = ? AND kind = 'delta' AND sealed = 0
+    `, [checkpointId, accountId, fileId]);
+    for (const row of rows) await this.deletePatch(accountId, row.version_id);
+  }
+
+  async dropExcessHistory(accountId: string, fileId: string, autoLimit: number): Promise<string[]> {
+    const rows = await this.sql.all<{
+      version_id: string;
+      created_at: number | string;
+      sync_trigger: string | null;
+      kind: string | null;
+      sealed: number | string | null;
+      folded_into: string | null;
+    }>(`
+      SELECT version_id, created_at, sync_trigger, kind, sealed, folded_into
       FROM file_versions WHERE account_id = ? AND file_id = ?
     `, [accountId, fileId]);
-    const drop = autoVersionsToDrop(rows.map((row) => ({
+    const drop = historyVersionsToDrop(rows.map((row) => ({
       versionId: row.version_id,
       createdAt: Number(row.created_at),
       syncTrigger: syncTriggerOf(row.sync_trigger),
+      kind: row.kind === "delta" ? "delta" as const : "checkpoint" as const,
+      sealed: Number(row.sealed) === 1,
+      foldedInto: row.folded_into ?? "",
     })), autoLimit);
     for (const versionId of drop) {
+      await this.deletePatch(accountId, versionId);
       await this.sql.run(
         "DELETE FROM file_versions WHERE account_id = ? AND version_id = ?",
         [accountId, versionId],
       );
     }
     return drop;
+  }
+
+  async setVersionCreatedAt(versionId: string, createdAt: number): Promise<void> {
+    await this.sql.run("UPDATE file_versions SET created_at = ? WHERE version_id = ?", [createdAt, versionId]);
+  }
+
+  async finishCheckpoint(row: FileVersionRow, autoLimit: number): Promise<HistoryWriteResult> {
+    await this.sql.exec("BEGIN");
+    try {
+      const latest = await this.latestFileVersion(row.accountId, row.fileId);
+      if (latest && latest.kind === "checkpoint" && latest.tipRev === row.tipRev && latest.contentMac === row.contentMac) {
+        await this.sealPendingDeltas(row.accountId, row.fileId, latest.versionId);
+        await this.sql.exec("COMMIT");
+        return { droppedVersionIds: [], versionId: latest.versionId, historyKind: "checkpoint", flush: emptyFlush() };
+      }
+      const stored = await this.insertFileVersion(row);
+      await this.sealPendingDeltas(row.accountId, row.fileId, stored.versionId);
+      const droppedVersionIds = await this.dropExcessHistory(row.accountId, row.fileId, autoLimit);
+      await this.sql.exec("COMMIT");
+      return { droppedVersionIds, versionId: stored.versionId, historyKind: "checkpoint", flush: emptyFlush() };
+    } catch (error) {
+      try {
+        await this.sql.exec("ROLLBACK");
+      } catch {
+        // The transaction may already be closed.
+      }
+      throw error;
+    }
   }
 
   async deletePlaintextVersions(accountId: string, vaultName: string): Promise<string[]> {
@@ -794,6 +951,7 @@ export class SyncDb {
     await this.sql.exec("BEGIN");
     try {
       for (const versionId of ids) {
+        await this.deletePatch(accountId, versionId);
         await this.sql.run(
           "DELETE FROM file_versions WHERE account_id = ? AND version_id = ?",
           [accountId, versionId],
@@ -950,6 +1108,13 @@ export async function openDatabase(config: AppConfig): Promise<SyncDb> {
   } catch {
     // New databases already have this column. Existing rows keep revision 1.
   }
+  for (const statement of versionColumnAlters()) {
+    try {
+      await database.exec(statement);
+    } catch {
+      // New databases already have the incremental-history columns.
+    }
+  }
   const missing = await database.all<{ account_id: string; vault_name: string }>(
     "SELECT account_id, vault_name FROM vault_policies WHERE vault_id IS NULL OR vault_id = ''",
   );
@@ -960,6 +1125,16 @@ export async function openDatabase(config: AppConfig): Promise<SyncDb> {
     );
   }
   return db;
+}
+
+function versionColumnAlters(): string[] {
+  return [
+    "ALTER TABLE file_versions ADD COLUMN kind VARCHAR(16) NOT NULL DEFAULT 'checkpoint'",
+    "ALTER TABLE file_versions ADD COLUMN base_version_id VARCHAR(64) NOT NULL DEFAULT ''",
+    "ALTER TABLE file_versions ADD COLUMN sealed INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE file_versions ADD COLUMN folded_into VARCHAR(64) NOT NULL DEFAULT ''",
+    "ALTER TABLE file_versions ADD COLUMN patch_bytes BIGINT NOT NULL DEFAULT 0",
+  ];
 }
 
 function schema(dialect: Queryable["dialect"]): string[] {
@@ -1070,6 +1245,17 @@ function schema(dialect: Queryable["dialect"]): string[] {
       encoding VARCHAR(16) NOT NULL DEFAULT 'e2ee',
       tip_rev BIGINT NOT NULL,
       sync_trigger VARCHAR(16) NOT NULL,
+      kind VARCHAR(16) NOT NULL DEFAULT 'checkpoint',
+      base_version_id VARCHAR(64) NOT NULL DEFAULT '',
+      sealed INTEGER NOT NULL DEFAULT 0,
+      folded_into VARCHAR(64) NOT NULL DEFAULT '',
+      patch_bytes BIGINT NOT NULL DEFAULT 0,
+      PRIMARY KEY (account_id, version_id)
+    )`,
+    `CREATE TABLE IF NOT EXISTS version_patches (
+      account_id VARCHAR(64) NOT NULL,
+      version_id VARCHAR(64) NOT NULL,
+      content ${large} NOT NULL,
       PRIMARY KEY (account_id, version_id)
     )`,
     `CREATE TABLE IF NOT EXISTS version_blobs (
@@ -1140,6 +1326,11 @@ function mapVersion(row: VersionSqlRow): FileVersionRow {
     encoding: row.encoding === "plain" ? "plain" : "e2ee",
     tipRev: Number.isSafeInteger(tipRev) && tipRev > 0 ? tipRev : 0,
     syncTrigger: syncTriggerOf(row.sync_trigger),
+    kind: row.kind === "delta" ? "delta" : "checkpoint",
+    baseVersionId: row.base_version_id ?? "",
+    sealed: Number(row.sealed) === 1,
+    foldedInto: row.folded_into ?? "",
+    patchBytes: Number(row.patch_bytes ?? 0),
   };
 }
 
