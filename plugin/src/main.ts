@@ -1,4 +1,5 @@
 import { Notice, Plugin, TFile, type ObsidianProtocolData } from "obsidian";
+import { clampAutoVersionLimit } from "../../shared/src/history";
 import { MIN_SECRET_LENGTH } from "../../shared/src/protocol";
 import { SyncClient, SessionExpiredError, exchangeLogin, resolveSyncHost } from "./client";
 import { clampMaxFileBytes, clampNonNegative, clampTrashDays } from "./limits";
@@ -9,6 +10,7 @@ import { applySharedConfig, readSharedConfig, writeSharedConfig } from "./shared
 import { promptBind } from "./bind-prompt";
 import { hasActiveBinding } from "./binding";
 import { allSuffixes } from "./file-kinds";
+import { FileHistoryModal } from "./history";
 import { E2eeSettingTab } from "./settings";
 import { RestoreModal, clampTransferParallel, isSyncablePath, propagatePlugin, pushVault, restoreVault, type RestoreMode } from "./sync";
 
@@ -53,6 +55,10 @@ export interface SyncSettings {
   trashDays: number;
   trashMaxFiles: number;
   conflictPolicy: "ask" | "snapshot" | "overwrite";
+  /** Default auto-version retention applied to files without their own limit. */
+  autoVersionLimit: number;
+  /** Per-file auto retention overrides. Manual caps stay on the server. */
+  versionLimitOverrides: Record<string, number>;
   syncSuffixes: string[];
   customSuffixes: string[];
   syncOther: boolean;
@@ -86,6 +92,8 @@ const DEFAULT_SETTINGS: SyncSettings = {
   trashDays: 30,
   trashMaxFiles: 200,
   conflictPolicy: "snapshot",
+  autoVersionLimit: 100,
+  versionLimitOverrides: {},
   syncSuffixes: allSuffixes(),
   customSuffixes: [],
   syncOther: true,
@@ -143,6 +151,13 @@ export default class E2eeSyncPlugin extends Plugin {
       name: t("commandRestore"),
       callback: () => {
         this.confirmRestore();
+      },
+    });
+    this.addCommand({
+      id: "file-history",
+      name: t("commandHistory"),
+      callback: () => {
+        this.openFileHistory();
       },
     });
 
@@ -221,6 +236,9 @@ export default class E2eeSyncPlugin extends Plugin {
     this.settings.trashDays = clampTrashDays(rest.trashDays);
     this.settings.trashMaxFiles = clampNonNegative(rest.trashMaxFiles, 200, 100_000);
     this.settings.conflictPolicy = rest.conflictPolicy === "ask" || rest.conflictPolicy === "overwrite" ? rest.conflictPolicy : "snapshot";
+    const storedLimit = rest.autoVersionLimit;
+    this.settings.autoVersionLimit = clampAutoVersionLimit(typeof storedLimit === "number" ? storedLimit : 100);
+    this.settings.versionLimitOverrides = normalizeVersionLimits(rest.versionLimitOverrides);
     const known = new Set(allSuffixes());
     const storedCustom = rest.customSuffixes;
     const custom = Array.isArray(storedCustom)
@@ -538,7 +556,7 @@ export default class E2eeSyncPlugin extends Plugin {
     this.syncing = true;
     this.setStatus(t("syncingNow"));
     try {
-      const summary = await pushVault(this);
+      const summary = await pushVault(this, manual ? "manual" : "auto");
       this.setStatus(summary);
       if (manual) new Notice(summary);
       return true;
@@ -567,6 +585,15 @@ export default class E2eeSyncPlugin extends Plugin {
     new RestoreModal(this.app, this).open();
   }
 
+  openFileHistory(): void {
+    new FileHistoryModal(this.app, this).open();
+  }
+
+  markClean(path: string): void {
+    this.dirtyPaths.delete(path);
+    this.refreshLiveStatus();
+  }
+
   async restoreNow(remote: { id: string; name: string }, mode: RestoreMode, folder = ""): Promise<void> {
     if (this.syncing) {
       new Notice(t("syncBusy"));
@@ -591,6 +618,16 @@ export default class E2eeSyncPlugin extends Plugin {
       }
     }
   }
+}
+
+function normalizeVersionLimits(value: unknown): Record<string, number> {
+  if (!value || typeof value !== "object") return {};
+  const limits: Record<string, number> = {};
+  for (const [fileId, raw] of Object.entries(value)) {
+    if (!/^[0-9a-f]{64}$/.test(fileId) || typeof raw !== "number") continue;
+    limits[fileId] = clampAutoVersionLimit(raw);
+  }
+  return limits;
 }
 
 function normalizeBindings(value: unknown): Record<string, VaultBinding> {

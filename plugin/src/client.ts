@@ -1,4 +1,5 @@
 import { requestUrl, type RequestUrlResponse } from "obsidian";
+import type { RetentionView, VersionDownload, VersionListResponse } from "../../shared/src/history";
 import {
   normalizeHost,
   remoteRev,
@@ -107,7 +108,11 @@ export class SyncClient {
     return this.authed("GET", `/api/v1/changes?${query.toString()}`);
   }
 
-  async putObject(fileId: string, payload: ObjectPayload): Promise<PutResult> {
+  async putObject(
+    fileId: string,
+    payload: ObjectPayload,
+    history?: { syncTrigger?: "auto" | "manual"; autoLimit?: number },
+  ): Promise<PutResult> {
     const content = JSON.stringify(payload.contentCipher);
     const bytes = new TextEncoder().encode(content).byteLength;
     const parentRev = payload.parentRev ?? null;
@@ -136,6 +141,8 @@ export class SyncClient {
       parentRev,
       parent_rev: parentRev,
       blobBytes: bytes,
+      ...(history?.syncTrigger ? { syncTrigger: history.syncTrigger } : {}),
+      ...(typeof history?.autoLimit === "number" ? { autoLimit: history.autoLimit } : {}),
     }), this.onRetry));
     const body = response.json as Partial<ConflictBody & PutResult> | null;
     if (response.status === 401) throw new SessionExpiredError();
@@ -215,6 +222,56 @@ export class SyncClient {
     } catch {
       throw new Error("The downloaded file was not valid ciphertext");
     }
+  }
+
+  listVersions(fileId: string, vault: string): Promise<VersionListResponse> {
+    const query = new URLSearchParams({ vault });
+    return this.authed("GET", `/api/v1/files/${fileId}/versions?${query.toString()}`);
+  }
+
+  versionDownloads(fileId: string, vault: string, versionIds: string[]): Promise<{ downloads: VersionDownload[] }> {
+    return this.authed("POST", `/api/v1/files/${fileId}/version-urls`, { vault, versionIds });
+  }
+
+  saveRetention(fileId: string, body: { autoLimit?: number; manualLimit?: number | null }): Promise<RetentionView> {
+    return this.authed("PUT", `/api/v1/files/${fileId}/retention`, body);
+  }
+
+  deletePlaintextHistory(vaultId: string): Promise<{ deleted: number }> {
+    return this.authed("POST", `/api/v1/vaults/${encodeURIComponent(vaultId)}/plaintext-history`);
+  }
+
+  async tipRevision(fileId: string, vaultId: string): Promise<number | null> {
+    const listed = await this.urlList(vaultId, { downloads: [fileId] });
+    if (listed.missing.includes(fileId)) return null;
+    const item = listed.downloads.find((entry) => entry.fileId === fileId);
+    return item ? item.rev : null;
+  }
+
+  async restoreVersion(fileId: string, versionId: string, vault: string, parentRev: number | null): Promise<PutResult> {
+    const response = await send("POST", `${this.host}/api/v1/files/${fileId}/versions/${versionId}/restore`, {
+      authorization: `Bearer ${this.token}`,
+      "content-type": "application/json; charset=utf-8",
+    }, JSON.stringify({
+      vault,
+      vaultId: vault,
+      parentRev,
+      parent_rev: parentRev,
+    }), this.onRetry);
+    const body = response.json as Partial<ConflictBody & PutResult> | null;
+    if (response.status === 409 && body && (body.reason === "parent_rev" || body.reason === "deleted")) {
+      throw new SyncConflictError(body.reason, conflictFile(body.file));
+    }
+    if (response.status >= 400) throw new Error(errorMessage(response));
+    return {
+      ok: true,
+      rev: typeof body?.rev === "number" ? body.rev : 0,
+      contentMac: typeof body?.contentMac === "string" ? body.contentMac : "",
+      mtime: typeof body?.mtime === "number" ? body.mtime : 0,
+      encoding: body?.encoding === "plain" || body?.encoding === "e2ee" ? body.encoding : "e2ee",
+      size: typeof body?.size === "number" ? body.size : 0,
+      updatedAt: typeof body?.updatedAt === "number" ? body.updatedAt : Date.now(),
+    };
   }
 
   deleteObjects(vault: string, ids: string[], localCount: number, clearUnnamed = false): Promise<{ deleted: number }> {

@@ -18,7 +18,8 @@ import type { ObjectRow, SyncDb } from "./db";
 import { HttpError } from "./http-error";
 import { accessPage, accountPage, adminPage, homePage, installPage, installPs1, installSh, loginPage, messagePage, obsidianReturnPage } from "./html";
 import { createBlobStore } from "./storage";
-import { acceptServerUpload, directRequestValid, discardUpload, finishUpload, listTransferUrls, serverDownload } from "./urls";
+import { acceptServerUpload, directRequestValid, discardUpload, finishUpload, listTransferUrls, listVersionDownloads, serverDownload, serverVersionDownload, versionRequestValid } from "./urls";
+import { assertVersionId, forgetVersionBlobs, parseHistoryOptions, parseRetentionBody, rememberVersion, retentionFor, toVersionInfo } from "./versions";
 import { completeOidcLogin, createOidcRequest } from "./oidc";
 import { clearCookieHeader, openSession, readCookie, sealSession, sessionCookieName, setCookieHeader } from "./session";
 import { hashPassword, randomPassword, validLoginId, verifyPassword } from "./passwords";
@@ -396,11 +397,12 @@ export function createApp(deps: AppDeps): Hono {
     if (!/^[0-9a-f-]{36}$/i.test(vaultId)) throw new HttpError(400, "Invalid vault id");
     const removed = await db.deleteVault(accountId, vaultId);
     if (!removed) throw new HttpError(404, "The remote vault does not exist");
-    for (const fileId of removed) {
+    for (const fileId of removed.fileIds) {
       await blobs.delete(accountId, fileId);
       await db.deleteObjectHash(accountId, fileId);
     }
-    return c.json({ ok: true, deleted: removed.length });
+    await forgetVersionBlobs(blobs, accountId, removed.versionIds);
+    return c.json({ ok: true, deleted: removed.fileIds.length });
   });
 
   api.get("/manifest", async (c) => {
@@ -444,7 +446,9 @@ export function createApp(deps: AppDeps): Hono {
     const fileId = c.req.param("fileId");
     if (!FILE_ID.test(fileId)) throw new HttpError(400, "Invalid file ID");
     const { accountId } = await requireToken(c);
-    const payload = parseCommitPayload(parseJson(await readBody(c)), config.requireEncryption);
+    const commitBody = parseJson(await readBody(c));
+    const payload = parseCommitPayload(commitBody, config.requireEncryption);
+    const history = parseHistoryOptions(commitBody);
     const named = payload.vaultId ? await db.findVaultById(accountId, payload.vaultId) : undefined;
     if (payload.vaultId && !named) throw new HttpError(404, "The remote vault does not exist");
     const vaultName = named?.name ?? payload.vault;
@@ -468,12 +472,13 @@ export function createApp(deps: AppDeps): Hono {
       encoding: payload.encoding,
     }, payload.parentRev ?? null, async () => {
       await finishUpload(config, db, blobs, accountId, fileId, payload.encoding);
-    }, payload.renamed === true);
+    }, payload.renamed === true, rememberVersion(db, blobs, history));
     try {
       await discardUpload(config, db, accountId, fileId);
     } catch {
       console.error("Failed to clear an upload slot");
     }
+    if (result.status !== "conflict") await forgetVersionBlobs(blobs, accountId, result.droppedVersionIds);
     if (result.status === "conflict") {
       const deleted = result.reason === "deleted";
       return c.json({
@@ -531,12 +536,32 @@ export function createApp(deps: AppDeps): Hono {
     return c.body(await serverDownload(blobs, accountId, fileId));
   });
 
+  api.get("/direct-version/:accountId/:versionId", async (c) => {
+    const accountId = c.req.param("accountId");
+    const versionId = c.req.param("versionId");
+    if (!directAccount(accountId) || !FILE_ID.test(versionId) || !versionRequestValid(
+      config.sessionSecret,
+      "GET",
+      accountId,
+      versionId,
+      c.req.query("exp") ?? "",
+      c.req.query("sig") ?? "",
+    )) {
+      throw new HttpError(401, "The signed URL is invalid or expired");
+    }
+    c.header("content-type", "application/json; charset=utf-8");
+    c.header("cache-control", "no-store");
+    return c.body(await serverVersionDownload(blobs, accountId, versionId));
+  });
+
   api.put("/objects/:fileId", async (c) => {
     const fileId = c.req.param("fileId");
     if (!FILE_ID.test(fileId)) throw new HttpError(400, "Invalid file ID");
     const raw = await readBody(c);
     const { accountId } = await requireToken(c);
-    const payload = parseObjectPayload(parseJson(raw), config.requireEncryption);
+    const objectBody = parseJson(raw);
+    const payload = parseObjectPayload(objectBody, config.requireEncryption);
+    const history = parseHistoryOptions(objectBody);
     const named = payload.vaultId ? await db.findVaultById(accountId, payload.vaultId) : undefined;
     if (payload.vaultId && !named) throw new HttpError(404, "The remote vault does not exist");
     const vaultName = named?.name ?? payload.vault;
@@ -557,7 +582,8 @@ export function createApp(deps: AppDeps): Hono {
       encoding: payload.encoding,
     }, payload.parentRev ?? null, async () => {
       await blobs.put(accountId, fileId, JSON.stringify(payload.contentCipher));
-    }, payload.renamed === true);
+    }, payload.renamed === true, rememberVersion(db, blobs, history));
+    if (result.status !== "conflict") await forgetVersionBlobs(blobs, accountId, result.droppedVersionIds);
     if (result.status === "conflict") {
       const deleted = result.reason === "deleted";
       return c.json({
@@ -693,6 +719,131 @@ export function createApp(deps: AppDeps): Hono {
     const restored = await db.restoreTrash(accountId, fileId, vault.name);
     if (!restored) throw new HttpError(404, "This file is not in the trash");
     return c.json({ ok: true, rev: restored.rev });
+  });
+
+  api.get("/files/:fileId/versions", async (c) => {
+    const fileId = c.req.param("fileId");
+    if (!FILE_ID.test(fileId)) throw new HttpError(400, "Invalid file ID");
+    const { accountId } = await requireToken(c);
+    const vaultName = await vaultNameFromQuery(accountId, c.req.query("vault"));
+    const limit = parseLimit(c.req.query("limit"));
+    const versions = (await db.listFileVersions(accountId, fileId, vaultName, limit)).map(toVersionInfo);
+    return c.json({
+      fileId,
+      retention: await retentionFor(db, accountId, fileId),
+      versions,
+    });
+  });
+
+  api.get("/files/:fileId/retention", async (c) => {
+    const fileId = c.req.param("fileId");
+    if (!FILE_ID.test(fileId)) throw new HttpError(400, "Invalid file ID");
+    const { accountId } = await requireToken(c);
+    return c.json(await retentionFor(db, accountId, fileId));
+  });
+
+  api.put("/files/:fileId/retention", async (c) => {
+    const fileId = c.req.param("fileId");
+    if (!FILE_ID.test(fileId)) throw new HttpError(400, "Invalid file ID");
+    const { accountId } = await requireToken(c);
+    const patch = parseRetentionBody(parseJson(await readBody(c)));
+    const current = await retentionFor(db, accountId, fileId);
+    const saved = await db.saveRetention(
+      accountId,
+      fileId,
+      patch.autoLimit ?? current.autoLimit,
+      patch.manualLimit,
+    );
+    return c.json({
+      autoLimit: saved.autoLimit,
+      manualLimit: saved.manualLimit,
+      manualLimitEnforced: false as const,
+    });
+  });
+
+  api.post("/files/:fileId/version-urls", async (c) => {
+    const fileId = c.req.param("fileId");
+    if (!FILE_ID.test(fileId)) throw new HttpError(400, "Invalid file ID");
+    const { accountId } = await requireToken(c);
+    const body = parseJson(await readBody(c)) as { vault?: unknown; versionIds?: unknown };
+    const vaultName = await vaultNameFromQuery(accountId, typeof body.vault === "string" ? body.vault : undefined);
+    if (!Array.isArray(body.versionIds) || body.versionIds.some((id) => typeof id !== "string")) {
+      throw new HttpError(400, "Invalid version list");
+    }
+    const downloads = await listVersionDownloads({
+      config,
+      db,
+      accountId,
+      fileId,
+      vaultName,
+      versionIds: body.versionIds,
+      origin: publicOrigin(c),
+    });
+    return c.json({ downloads });
+  });
+
+  api.post("/files/:fileId/versions/:versionId/restore", async (c) => {
+    const fileId = c.req.param("fileId");
+    const versionId = c.req.param("versionId");
+    if (!FILE_ID.test(fileId)) throw new HttpError(400, "Invalid file ID");
+    assertVersionId(versionId);
+    const { accountId } = await requireToken(c);
+    const body = parseJson(await readBody(c, 16 * 1024));
+    const requested = body as { vault?: unknown; vaultId?: unknown };
+    const vaultKey = typeof requested.vaultId === "string" && requested.vaultId
+      ? requested.vaultId
+      : typeof requested.vault === "string" ? requested.vault : undefined;
+    const vaultName = await vaultNameFromQuery(accountId, vaultKey);
+    const version = await db.findFileVersion(accountId, versionId);
+    if (!version || version.fileId !== fileId || version.vaultName !== vaultName) {
+      throw new HttpError(404, "This version is not on the server");
+    }
+    const parentRev = parseParentRev(body);
+    const result = await db.putObjectRevision({
+      accountId,
+      fileId,
+      vaultName,
+      pathCipher: version.pathCipher,
+      pathMac: "",
+      contentMac: version.contentMac,
+      size: version.size,
+      mtime: version.mtime,
+      encoding: version.encoding,
+    }, parentRev, async () => {
+      await blobs.put(accountId, fileId, await blobs.getVersion(accountId, versionId));
+    }, false, rememberVersion(db, blobs, { syncTrigger: "restore" }));
+    if (result.status !== "conflict") await forgetVersionBlobs(blobs, accountId, result.droppedVersionIds);
+    if (result.status === "conflict") {
+      const deleted = result.reason === "deleted";
+      return c.json({
+        error: deleted
+          ? "The remote copy was deleted since this device last synced"
+          : "The remote copy changed since this device last synced",
+        reason: result.reason,
+        file: result.current ? toRemoteFile(result.current) : null,
+      }, 409);
+    }
+    return c.json({
+      ok: true,
+      rev: result.row.rev,
+      contentMac: result.row.contentMac,
+      mtime: result.row.mtime,
+      encoding: result.row.encoding,
+      size: result.row.size,
+      updatedAt: result.row.updatedAt,
+    });
+  });
+
+  api.post("/vaults/:vaultId/plaintext-history", async (c) => {
+    const { accountId } = await requireToken(c);
+    const vaultId = c.req.param("vaultId").trim();
+    if (!/^[0-9a-f-]{36}$/i.test(vaultId)) throw new HttpError(400, "Invalid vault id");
+    const vault = await db.findVaultById(accountId, vaultId);
+    if (!vault) throw new HttpError(404, "The remote vault does not exist");
+    if (!vault.encrypted) throw new HttpError(409, "Plaintext history is only removed after the vault is encrypted");
+    const versionIds = await db.deletePlaintextVersions(accountId, vault.name);
+    await forgetVersionBlobs(blobs, accountId, versionIds);
+    return c.json({ deleted: versionIds.length });
   });
 
   app.route("/api/v1", api);
