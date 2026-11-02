@@ -12,8 +12,8 @@ export function sessionCookieName(): string {
   return COOKIE;
 }
 
-export function sealSession(accountId: string, secret: string): string {
-  const body = Buffer.from(JSON.stringify({ accountId, exp: Date.now() + TTL_MS } satisfies SessionBody)).toString("base64url");
+export function sealSession(accountId: string, secret: string, ttlMs = TTL_MS): string {
+  const body = Buffer.from(JSON.stringify({ accountId, exp: Date.now() + ttlMs } satisfies SessionBody)).toString("base64url");
   const sig = createHmac("sha256", secret).update(body).digest("base64url");
   return `${body}.${sig}`;
 }
@@ -46,13 +46,13 @@ export function readCookie(header: string | undefined, name: string): string | u
   return undefined;
 }
 
-export function setCookieHeader(token: string, secure: boolean): string {
+export function setCookieHeader(token: string, secure: boolean, ttlMs = TTL_MS): string {
   const parts = [
     `${COOKIE}=${encodeURIComponent(token)}`,
     "HttpOnly",
     "SameSite=Lax",
     "Path=/",
-    `Max-Age=${Math.floor(TTL_MS / 1000)}`,
+    `Max-Age=${Math.floor(ttlMs / 1000)}`,
   ];
   if (secure) parts.push("Secure");
   return parts.join("; ");

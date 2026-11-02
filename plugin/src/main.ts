@@ -1,7 +1,8 @@
-import { Notice, Plugin, type ObsidianProtocolData } from "obsidian";
+import { Notice, Plugin, TFile, type ObsidianProtocolData } from "obsidian";
 import { clampAutoVersionLimit } from "../../shared/src/history";
 import { MIN_SECRET_LENGTH } from "../../shared/src/protocol";
-import { SyncClient, exchangeLogin, resolveSyncHost } from "./client";
+import { SyncClient, SessionExpiredError, exchangeLogin, resolveSyncHost } from "./client";
+import { clampMaxFileBytes, clampNonNegative, clampTrashDays } from "./limits";
 import { offerGitignore } from "./gitignore-prompt";
 import { t } from "./i18n";
 import { openLocal, sealLocal } from "./local-secret";
@@ -22,6 +23,8 @@ export interface FileIndexEntry {
   syncedAt?: number;
   /** Last revision successfully synced with the server. */
   rev?: number;
+  /** The path changed locally and still needs to be uploaded. */
+  pathDirty?: boolean;
 }
 
 export interface VaultBinding {
@@ -45,6 +48,13 @@ export interface SyncSettings {
   autoSync: boolean;
   autoSyncSeconds: number;
   transferParallel: number;
+  excludePatterns: string[];
+  maxFileBytes: number;
+  vaultMaxFiles: number;
+  vaultMaxBytes: number;
+  trashDays: number;
+  trashMaxFiles: number;
+  conflictPolicy: "ask" | "snapshot" | "overwrite";
   /** Default auto-version retention applied to files without their own limit. */
   autoVersionLimit: number;
   /** Per-file auto retention overrides. Manual caps stay on the server. */
@@ -75,6 +85,13 @@ const DEFAULT_SETTINGS: SyncSettings = {
   autoSync: true,
   autoSyncSeconds: 30,
   transferParallel: 10,
+  excludePatterns: [],
+  maxFileBytes: 32 * 1024 * 1024,
+  vaultMaxFiles: 0,
+  vaultMaxBytes: 0,
+  trashDays: 30,
+  trashMaxFiles: 200,
+  conflictPolicy: "snapshot",
   autoVersionLimit: 100,
   versionLimitOverrides: {},
   syncSuffixes: allSuffixes(),
@@ -152,7 +169,22 @@ export default class E2eeSyncPlugin extends Plugin {
     this.registerEvent(this.app.vault.on("create", bump));
     this.registerEvent(this.app.vault.on("modify", bump));
     this.registerEvent(this.app.vault.on("delete", bump));
-    this.registerEvent(this.app.vault.on("rename", bump));
+    this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
+      if (file instanceof TFile) {
+        for (const entry of Object.values(this.settings.index)) {
+          if (entry.path !== oldPath) continue;
+          entry.path = file.path;
+          entry.pathDirty = true;
+          entry.mtime = file.stat.mtime;
+          entry.size = file.stat.size;
+          break;
+        }
+        this.dirtyPaths.delete(oldPath);
+        if (isSyncablePath(file.path)) this.dirtyPaths.add(file.path);
+        void this.saveSettings();
+      }
+      this.refreshLiveStatus();
+    }));
     this.registerEvent(this.app.workspace.on("file-open", () => this.refreshLiveStatus()));
     this.registerEvent(this.app.workspace.on("editor-change", () => {
       const file = this.app.workspace.getActiveFile();
@@ -195,6 +227,15 @@ export default class E2eeSyncPlugin extends Plugin {
     }
     const parallel = this.settings.transferParallel;
     this.settings.transferParallel = clampTransferParallel(typeof parallel === "number" ? parallel : 10);
+    this.settings.excludePatterns = Array.isArray(rest.excludePatterns)
+      ? rest.excludePatterns.filter((item): item is string => typeof item === "string" && item.trim().length > 0).slice(0, 200)
+      : [];
+    this.settings.maxFileBytes = clampMaxFileBytes(rest.maxFileBytes);
+    this.settings.vaultMaxFiles = clampNonNegative(rest.vaultMaxFiles, 0, 1_000_000);
+    this.settings.vaultMaxBytes = clampNonNegative(rest.vaultMaxBytes, 0, 1024 * 1024 * 1024 * 1024);
+    this.settings.trashDays = clampTrashDays(rest.trashDays);
+    this.settings.trashMaxFiles = clampNonNegative(rest.trashMaxFiles, 200, 100_000);
+    this.settings.conflictPolicy = rest.conflictPolicy === "ask" || rest.conflictPolicy === "overwrite" ? rest.conflictPolicy : "snapshot";
     const storedLimit = rest.autoVersionLimit;
     this.settings.autoVersionLimit = clampAutoVersionLimit(typeof storedLimit === "number" ? storedLimit : 100);
     this.settings.versionLimitOverrides = normalizeVersionLimits(rest.versionLimitOverrides);
@@ -520,6 +561,10 @@ export default class E2eeSyncPlugin extends Plugin {
       if (manual) new Notice(summary);
       return true;
     } catch (error) {
+      if (error instanceof SessionExpiredError) {
+        this.setLogin("", "", "");
+        await this.saveSettings();
+      }
       const message = error instanceof Error ? error.message : t("syncFailed");
       this.settings.lastSyncSummary = message;
       await this.saveSettings();
