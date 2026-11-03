@@ -1,4 +1,4 @@
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import type { VersionDownload, VersionKind } from "../../shared/src/history";
 import {
   MAX_BODY_BYTES,
@@ -13,10 +13,10 @@ import {
 import type { AppConfig } from "./config";
 import type { ObjectRow, SyncDb } from "./db";
 import { HttpError } from "./http-error";
-import { R2Client } from "./r2";
+import { R2Client, SIGN_R2_CHECKSUM } from "./r2";
 import { storedBytes, type BlobStore } from "./storage";
 
-export const URL_TTL_MS = 60 * 60 * 1000;
+export const URL_TTL_MS = 15 * 60 * 1000;
 export const URL_LIST_LIMIT = 200;
 const FILE_ID = /^[0-9a-f]{64}$/;
 
@@ -27,7 +27,7 @@ export async function listTransferUrls(input: {
   vaultName: string;
   origin: string;
   downloads: string[];
-  uploads: { fileId: string; parentRev: number | null; bytes: number }[];
+  uploads: { fileId: string; parentRev: number | null; bytes: number; sha256?: string }[];
   now?: number;
 }): Promise<UrlListResponse> {
   if (input.downloads.length > URL_LIST_LIMIT || input.uploads.length > URL_LIST_LIMIT) {
@@ -44,6 +44,7 @@ export async function listTransferUrls(input: {
       continue;
     }
     const link = await downloadLink(input.config, input.db, input.accountId, fileId, input.origin, now);
+    const sha256 = await input.db.getObjectHash(input.accountId, fileId);
     downloads.push({
       ...link,
       pathCipher: JSON.parse(row.pathCipher) as PayloadCipher,
@@ -53,6 +54,7 @@ export async function listTransferUrls(input: {
       updatedAt: row.updatedAt,
       encoding: row.encoding,
       rev: row.rev,
+      ...(sha256 ? { sha256 } : {}),
     });
   }
   const uploads: SignedTransfer[] = [];
@@ -76,7 +78,7 @@ export async function listTransferUrls(input: {
       conflicts.push({ fileId: item.fileId, reason: "parent_rev", file: remoteFile(existing) });
       continue;
     }
-    uploads.push(await uploadLink(input.config, input.db, input.accountId, item.fileId, item.bytes, input.origin, now));
+    uploads.push(await uploadLink(input.config, input.db, input.accountId, item.fileId, item.bytes, input.origin, now, item.sha256 ?? ""));
   }
   return { downloads, uploads, conflicts, missing };
 }
@@ -179,6 +181,7 @@ export async function acceptServerUpload(
   if (grant.kind !== "server") throw new HttpError(400, "This upload URL does not accept a server body");
   if (body.byteLength !== grant.bytes) throw new HttpError(400, "Uploaded object size does not match");
   const text = body.toString("utf8");
+  if (grant.sha256 && sha256Hex(text) !== grant.sha256) throw new HttpError(400, "Uploaded object hash does not match");
   parseStoredCipher(text, config.requireEncryption);
   await db.putUploadBody(accountId, fileId, text);
 }
@@ -205,11 +208,13 @@ export async function finishUpload(
     const body = await db.getUploadBody(accountId, fileId);
     if (body === undefined) throw new HttpError(400, "The upload has not arrived");
     if (storedBytes(body) !== grant.bytes) throw new HttpError(400, "Uploaded object size does not match");
+    if (grant.sha256 && sha256Hex(body) !== grant.sha256) throw new HttpError(400, "Uploaded object hash does not match");
     const cipher = parseStoredCipher(body, config.requireEncryption);
     if ((cipher.v === 0 ? "plain" : "e2ee") !== encoding) {
       throw new HttpError(400, "Ciphertext format does not match the encryption flag");
     }
     await blobs.put(accountId, fileId, body);
+    if (grant.sha256) await db.setObjectHash(accountId, fileId, grant.sha256);
     await db.deleteUploadBody(accountId, fileId);
     return;
   }
@@ -219,14 +224,15 @@ export async function finishUpload(
   if (size === undefined) throw new HttpError(400, "The upload has not arrived");
   if (size !== grant.bytes) throw new HttpError(400, "Uploaded object size does not match");
   await remote.copyStaging(accountId, fileId);
+  if (grant.sha256) await db.setObjectHash(accountId, fileId, grant.sha256);
   await db.deleteBlob(accountId, fileId);
 }
 
 export async function discardUpload(config: AppConfig, db: SyncDb, accountId: string, fileId: string): Promise<void> {
-  await db.deleteUploadGrant(accountId, fileId);
-  await db.deleteUploadBody(accountId, fileId);
   const remote = openR2(config);
   if (remote) await remote.deleteStaging(accountId, fileId);
+  await db.deleteUploadGrant(accountId, fileId);
+  await db.deleteUploadBody(accountId, fileId);
 }
 
 async function downloadLink(
@@ -260,23 +266,32 @@ async function uploadLink(
   bytes: number,
   origin: string,
   now: number,
+  sha256: string,
 ): Promise<SignedTransfer> {
   const exp = now + URL_TTL_MS;
   const onR2 = config.storage.kind === "r2" && bytes >= config.storage.inlineMaxBytes;
-  await db.putUploadGrant(accountId, fileId, bytes, onR2 ? "r2" : "server", exp);
+  await db.putUploadGrant(accountId, fileId, bytes, onR2 ? "r2" : "server", exp, sha256);
   if (onR2) {
     await db.deleteUploadBody(accountId, fileId);
     const remote = openR2(config);
     if (!remote) throw new HttpError(500, "R2 storage is not ready");
+    const checksum = SIGN_R2_CHECKSUM && /^[0-9a-f]{64}$/.test(sha256)
+      ? Buffer.from(sha256, "hex").toString("base64")
+      : "";
     return {
       fileId,
-      url: remote.presignUpload(accountId, fileId, Math.ceil(URL_TTL_MS / 1000)),
+      url: remote.presignUpload(accountId, fileId, Math.ceil(URL_TTL_MS / 1000), checksum || undefined),
       expiresAt: exp,
+      ...(checksum ? { headers: { "x-amz-checksum-sha256": checksum } } : {}),
     };
   }
   const remote = openR2(config);
   if (remote) await remote.deleteStaging(accountId, fileId);
   return { fileId, url: serverUrl(config, origin, "PUT", accountId, fileId, exp), expiresAt: exp };
+}
+
+function sha256Hex(text: string): string {
+  return createHash("sha256").update(text).digest("hex");
 }
 
 async function versionDownloadLink(
@@ -326,7 +341,7 @@ function directSignature(secret: string, method: string, accountId: string, file
   return createHmac("sha256", secret).update(`${method.toUpperCase()}\n${accountId}\n${fileId}\n${exp}`).digest("hex");
 }
 
-async function freshGrant(db: SyncDb, accountId: string, fileId: string, now: number): Promise<{ bytes: number; kind: "server" | "r2"; expiresAt: number }> {
+async function freshGrant(db: SyncDb, accountId: string, fileId: string, now: number): Promise<{ bytes: number; kind: "server" | "r2"; expiresAt: number; sha256: string }> {
   const grant = await db.getUploadGrant(accountId, fileId);
   if (!grant || grant.expiresAt <= now) throw new HttpError(400, "The upload URL has expired");
   return grant;

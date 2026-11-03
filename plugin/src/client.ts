@@ -69,6 +69,21 @@ export async function pollDevice(host: string, code: string): Promise<{ pending:
   throw new Error(errorMessage(response));
 }
 
+export class SessionExpiredError extends Error {
+  constructor() {
+    super("The login expired. Log in again.");
+    this.name = "SessionExpiredError";
+  }
+}
+
+let commitTail: Promise<void> = Promise.resolve();
+
+function queueCommit<T>(work: () => Promise<T>): Promise<T> {
+  const run = commitTail.then(work, work);
+  commitTail = run.then(() => undefined, () => undefined);
+  return run;
+}
+
 export class SyncClient {
   constructor(
     private readonly host: string,
@@ -107,21 +122,23 @@ export class SyncClient {
     const bytes = new TextEncoder().encode(content).byteLength;
     const parentRev = payload.parentRev ?? null;
     const listed = await this.urlList(payload.vaultId || payload.vault, {
-      uploads: [{ fileId, parentRev, bytes }],
+      uploads: [{ fileId, parentRev, bytes, sha256: sha256Hex(content) }],
     });
     const conflict = listed.conflicts.find((item) => item.fileId === fileId);
     if (conflict) throw new SyncConflictError(conflict.reason, conflictFile(conflict.file));
     const upload = listed.uploads.find((item) => item.fileId === fileId);
     if (!upload) throw new Error("The server did not return an upload URL");
-    const sent = await transfer("PUT", upload.url, content);
+    const sent = await transfer("PUT", upload.url, content, upload.headers);
     if (sent.status >= 400) throw new Error(errorMessage(sent));
-    const response = await send("POST", `${this.host}/api/v1/objects/${fileId}/commit`, {
+    const response = await queueCommit(() => send("POST", `${this.host}/api/v1/objects/${fileId}/commit`, {
       authorization: `Bearer ${this.token}`,
       "content-type": "application/json; charset=utf-8",
     }, JSON.stringify({
       vault: payload.vault,
       vaultId: payload.vaultId,
       pathCipher: payload.pathCipher,
+      pathMac: payload.pathMac,
+      renamed: payload.renamed === true,
       contentMac: payload.contentMac,
       size: payload.size,
       mtime: payload.mtime,
@@ -133,8 +150,9 @@ export class SyncClient {
       ...(typeof history?.autoLimit === "number" ? { autoLimit: history.autoLimit } : {}),
       ...(history?.historyKind ? { historyKind: history.historyKind } : {}),
       ...(history?.patchCipher ? { patchCipher: history.patchCipher } : {}),
-    }), this.onRetry);
+    }), this.onRetry));
     const body = response.json as Partial<ConflictBody & PutResult> | null;
+    if (response.status === 401) throw new SessionExpiredError();
     if (response.status === 409 && body && (body.reason === "parent_rev" || body.reason === "deleted")) {
       throw new SyncConflictError(body.reason, conflictFile(body.file));
     }
@@ -206,7 +224,27 @@ export class SyncClient {
     return this.readObject(item);
   }
 
-  urlList(vault: string, query: { downloads?: string[]; uploads?: { fileId: string; parentRev?: number | null; bytes: number }[] }): Promise<UrlListResponse> {
+  loginPassword(loginId: string, password: string): Promise<{ accountId: string; displayName: string; apiToken: string }> {
+    return publicJson(this.host, "POST", "/api/v1/login", { loginId, password });
+  }
+
+  changePassword(current: string, next: string): Promise<{ ok: boolean }> {
+    return this.authed("POST", "/api/v1/password", { current, next });
+  }
+
+  putPolicy(body: { trashDays: number; trashMaxFiles: number; vaultId?: string; maxFiles?: number; maxBytes?: number }): Promise<{ ok: boolean }> {
+    return this.authed("POST", "/api/v1/policy", body);
+  }
+
+  listTrash(vaultId: string): Promise<{ items: { fileId: string; pathCipher: PayloadCipher; size: number; deletedAt: number; rev: number }[] }> {
+    return this.authed("GET", `/api/v1/trash?vault=${encodeURIComponent(vaultId)}`);
+  }
+
+  restoreTrash(vaultId: string, fileId: string): Promise<{ ok: boolean; rev: number }> {
+    return this.authed("POST", `/api/v1/trash/${fileId}/restore`, { vaultId });
+  }
+
+  urlList(vault: string, query: { downloads?: string[]; uploads?: { fileId: string; parentRev?: number | null; bytes: number; sha256?: string }[] }): Promise<UrlListResponse> {
     return this.authed<UrlListResponse>("POST", "/api/v1/urls", {
       vault,
       downloads: query.downloads ?? [],
@@ -215,7 +253,7 @@ export class SyncClient {
   }
 
   async readObject(item: DownloadUrl): Promise<ObjectPayload> {
-    const contentCipher = await this.fetchCipher(item.url);
+    const contentCipher = await this.fetchCipher(item.url, item.sha256);
     return {
       vault: "",
       pathCipher: item.pathCipher,
@@ -227,10 +265,11 @@ export class SyncClient {
     };
   }
 
-  async fetchCipher(url: string): Promise<PayloadCipher> {
+  async fetchCipher(url: string, sha256?: string): Promise<PayloadCipher> {
     const response = await transfer("GET", url);
     if (response.status === 404) throw new Error("This file is not on the server");
     if (response.status >= 400) throw new Error(errorMessage(response));
+    if (sha256 && sha256Hex(response.text ?? "") !== sha256) throw new Error("The downloaded object hash does not match");
     try {
       const parsed = JSON.parse(response.text) as PayloadCipher;
       if (!parsed || (parsed.v !== 0 && parsed.v !== 1)) throw new Error("invalid");
@@ -322,6 +361,7 @@ export class SyncClient {
     const headers: Record<string, string> = { authorization: `Bearer ${this.token}` };
     if (bodyText) headers["content-type"] = "application/json; charset=utf-8";
     const response = await send(method, this.host + path, headers, bodyText || undefined, this.onRetry);
+    if (response.status === 401) throw new SessionExpiredError();
     if (response.status >= 400) throw new Error(errorMessage(response));
     return response.json as T;
   }
@@ -397,8 +437,18 @@ function normalizeUrlList(value: UrlListResponse): UrlListResponse {
   };
 }
 
-async function transfer(method: "GET" | "PUT", url: string, body?: string): Promise<RequestUrlResponse> {
-  return send(method, url, body === undefined ? undefined : { "content-type": "application/json; charset=utf-8" }, body, undefined, 120_000);
+async function transfer(method: "GET" | "PUT", url: string, body?: string, extra?: Record<string, string>): Promise<RequestUrlResponse> {
+  const headers = body === undefined ? extra : { "content-type": "application/json; charset=utf-8", ...extra };
+  return send(method, url, headers, body, undefined, 120_000);
+}
+
+function sha256Hex(text: string): string {
+  try {
+    const crypto = require("crypto") as { createHash: (algorithm: string) => { update: (value: string) => { digest: (encoding: string) => string } } };
+    return crypto.createHash("sha256").update(text).digest("hex");
+  } catch {
+    return "";
+  }
 }
 
 async function send(

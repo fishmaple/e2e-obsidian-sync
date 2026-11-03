@@ -142,16 +142,26 @@ export function loginPage(options: {
         <p class="muted">这是未配置 SSO 时的本地登录，同一个显示名会得到同一个账户 ID。</p>
       </form>`
     : "";
-  const empty = !options.oidc && !options.devLogin
-    ? `<p>请配置 OIDC 环境变量，或把 ALLOW_DEV_LOGIN 设为 true。</p>`
-    : "";
+  const password = `<form method="post" action="/auth/password">
+        ${hidden}
+        <div>
+          <label for="loginId">登录 ID</label>
+          <input id="loginId" name="loginId" autocomplete="username" required>
+        </div>
+        <div>
+          <label for="password">密码</label>
+          <input id="password" name="password" type="password" autocomplete="current-password" required>
+        </div>
+        <button type="submit">登录</button>
+      </form>`;
+  const empty = "";
   const lead = back
     ? "登录完成后会跳回 Obsidian，插件会自动填入账户。"
-    : "登录后可以在账户页查看同步情况。";
+    : "用登录 ID 和密码进入。ID 就是 Obsidian 里显示的账户。";
   return layout("登录", `
     <p>${lead}</p>
     ${error}
-    <div class="card">${sso}${sso && dev ? "<div style='height:16px'></div>" : ""}${dev}${empty}</div>
+    <div class="card">${password}${sso ? "<div style='height:16px'></div>" : ""}${sso}${dev ? "<div style='height:16px'></div>" : ""}${dev}${empty}</div>
     <div class="row" style="margin-top:18px">
       <a class="button secondary" href="/">回首页</a>
       <a class="button secondary" href="/install">先装插件</a>
@@ -321,8 +331,8 @@ export function homePage(options: { loggedIn: boolean }): string {
   const next = options.loggedIn
     ? `<a class="button" href="/account">查看同步情况</a>`
     : `<a class="button" href="/login">登录</a>`;
-  return layout("端到端加密同步", `
-    <p>笔记留在你的 Obsidian 里。这台服务器只保存同步结果，不保存密钥。</p>
+  return layout("Siltquill", `
+    <p>笔记留在你的 Obsidian 里。这台服务器只保存同步结果。端到端加密可以按库打开，密钥不上传。</p>
     <div class="card">
       <h2 style="margin-top:0">三步开始</h2>
       <ol>
@@ -600,6 +610,64 @@ export function messagePage(title: string, message: string): string {
         <a class="button secondary" href="/login">去登录</a>
         <a class="button secondary" href="/account">同步情况</a>
       </div>
+    </div>
+  `);
+}
+
+export function adminPage(options: {
+  locked?: boolean;
+  badKey?: boolean;
+  notice?: string;
+  accounts: { id: string; displayName: string; loginId: string }[];
+  created?: { loginId: string; password: string };
+}): string {
+  if (options.locked) {
+    return layout("管理登录", `
+      <div class="card">
+        <form method="post" action="/admin/login">
+          <label for="key">管理密钥</label>
+          <input id="key" name="key" type="password" required>
+          <button type="submit">进入</button>
+        </form>
+        ${options.badKey ? `<p class="warn">密钥不对</p>` : ""}
+      </div>
+    `);
+  }
+  const rows = options.accounts.map((account) => `<tr>
+    <td class="id">${esc(account.loginId || "未分配")}</td>
+    <td>${esc(account.displayName)}</td>
+    <td class="id">${esc(account.id)}</td>
+    <td>
+      <form method="post" action="/admin/reset">
+        <input type="hidden" name="accountId" value="${esc(account.id)}">
+        <input name="loginId" placeholder="登录 ID" value="${esc(account.loginId)}" required>
+        <button type="submit">重置密码</button>
+      </form>
+    </td>
+  </tr>`).join("");
+  const created = options.created
+    ? `<p class="warn">新密码只显示这一次。登录 ID ${esc(options.created.loginId)}，密码 ${esc(options.created.password)}</p>`
+    : "";
+  return layout("管理登录 ID", `
+    ${options.notice ? `<p>${esc(options.notice)}</p>` : ""}
+    ${created}
+    <div class="card">
+      <h2 style="margin-top:0">已有账户</h2>
+      <table>
+        <tr><th>登录 ID</th><th>显示名</th><th>账户</th><th></th></tr>
+        ${rows || "<tr><td colspan='4'>还没有账户</td></tr>"}
+      </table>
+    </div>
+    <div class="card">
+      <h2 style="margin-top:0">新建登录 ID</h2>
+      <form method="post" action="/admin/users">
+        <label for="loginId">登录 ID</label>
+        <input id="loginId" name="loginId" required>
+        <label for="accountId">绑定已有账户（可空）</label>
+        <input id="accountId" name="accountId">
+        <p class="muted">密码随机生成，只显示一次。填写账户 ID 会把这个登录 ID 接到已有数据上。</p>
+        <button type="submit">创建</button>
+      </form>
     </div>
   `);
 }

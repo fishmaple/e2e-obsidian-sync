@@ -24,6 +24,7 @@ export interface ObjectRow {
   updatedAt: number;
   encoding: Encoding;
   rev: number;
+  pathMac: string;
 }
 
 export interface ChangeRow {
@@ -123,6 +124,7 @@ interface ObjectSqlRow {
   updated_at: number | string;
   encoding: string | null;
   rev: number | string | null;
+  path_mac?: string | null;
 }
 
 interface ChangeSqlRow {
@@ -137,7 +139,7 @@ interface ChangeSqlRow {
   encoding: string | null;
 }
 
-const OBJECT_COLUMNS = "account_id, file_id, vault_name, path_cipher, content_mac, size, mtime, updated_at, encoding, rev";
+const OBJECT_COLUMNS = "account_id, file_id, vault_name, path_cipher, content_mac, size, mtime, updated_at, encoding, rev, path_mac";
 const VERSION_COLUMNS = "account_id, version_id, file_id, vault_name, path_cipher, content_mac, size, mtime, created_at, encoding, tip_rev, sync_trigger, kind, base_version_id, sealed, folded_into, patch_bytes";
 
 interface VersionSqlRow {
@@ -296,22 +298,28 @@ export class SyncDb {
     return Boolean(await this.findAuthKey(accountId));
   }
 
-  async issueToken(accountId: string): Promise<string> {
+  async issueToken(accountId: string, ttlMs: number): Promise<string> {
     const token = bytesToBase64Url(randomBytes(32));
+    const now = Date.now();
     await this.sql.run(
-      "INSERT INTO api_tokens (token_hash, account_id, created_at) VALUES (?, ?, ?)",
-      [hashToken(token), accountId, Date.now()],
+      "INSERT INTO api_tokens (token_hash, account_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
+      [hashToken(token), accountId, now, now + ttlMs],
     );
     return token;
   }
 
   async findAccountByToken(token: string): Promise<string | undefined> {
     if (!token || token.length > 200) return undefined;
-    const row = await this.sql.get<{ account_id: string }>(
-      "SELECT account_id FROM api_tokens WHERE token_hash = ?",
+    const row = await this.sql.get<{ account_id: string; expires_at: number | string | null }>(
+      "SELECT account_id, expires_at FROM api_tokens WHERE token_hash = ?",
       [hashToken(token)],
     );
-    return row?.account_id;
+    if (!row) return undefined;
+    if (Number(row.expires_at) <= Date.now()) {
+      await this.sql.run("DELETE FROM api_tokens WHERE token_hash = ?", [hashToken(token)]);
+      return undefined;
+    }
+    return row.account_id;
   }
 
   async revokeToken(token: string): Promise<void> {
@@ -493,14 +501,65 @@ export class SyncDb {
     row: Omit<ObjectRow, "rev" | "updatedAt">,
     parentRev: number | null,
     writeBlob: () => Promise<void>,
+    renamed = false,
     recordVersion?: (row: ObjectRow) => Promise<HistoryWriteResult>,
   ): Promise<PutRevisionResult> {
     await this.sql.exec("BEGIN");
     try {
       const existing = await this.findObject(row.accountId, row.fileId);
       if (existing && existing.contentMac === row.contentMac && existing.encoding === row.encoding) {
+        const samePath = existing.vaultName === row.vaultName
+          && existing.pathMac !== ""
+          && existing.pathMac === row.pathMac;
+        const backfill = !renamed && existing.vaultName === row.vaultName
+          && (existing.pathMac === "" || existing.pathMac === row.pathMac);
+        if (samePath || backfill) {
+          if (existing.pathMac === "" && row.pathMac) {
+            await this.sql.run(
+              "UPDATE objects SET path_cipher = ?, path_mac = ? WHERE account_id = ? AND file_id = ?",
+              [row.pathCipher, row.pathMac, row.accountId, row.fileId],
+            );
+          }
+          await this.sql.exec("COMMIT");
+          return { status: "unchanged", row: existing, history: noHistory() };
+        }
+        if (parentRev === null || parentRev !== existing.rev) {
+          await this.sql.exec("COMMIT");
+          return { status: "conflict", reason: "parent_rev", current: existing };
+        }
+        const moved: ObjectRow = {
+          ...existing,
+          vaultName: row.vaultName,
+          pathCipher: row.pathCipher,
+          pathMac: row.pathMac,
+          mtime: row.mtime,
+          rev: existing.rev + 1,
+          updatedAt: Date.now(),
+        };
+        const changed = await this.sql.run(`
+          UPDATE objects
+          SET vault_name = ?, path_cipher = ?, path_mac = ?, mtime = ?, updated_at = ?, rev = ?
+          WHERE account_id = ? AND file_id = ? AND rev = ?
+        `, [
+          moved.vaultName,
+          moved.pathCipher,
+          moved.pathMac,
+          moved.mtime,
+          moved.updatedAt,
+          moved.rev,
+          moved.accountId,
+          moved.fileId,
+          parentRev,
+        ]);
+        if (changed === 0) {
+          const current = await this.findObject(row.accountId, row.fileId);
+          await this.sql.exec("COMMIT");
+          return { status: "conflict", reason: current ? "parent_rev" : "deleted", current: current ?? null };
+        }
+        await this.appendChange(moved, "upsert");
+        const history = recordVersion ? await recordVersion(moved) : noHistory();
         await this.sql.exec("COMMIT");
-        return { status: "unchanged", row: existing, history: noHistory() };
+        return { status: "updated", row: moved, history };
       }
       if (!existing) {
         if (parentRev !== null) {
@@ -522,11 +581,12 @@ export class SyncDb {
       const updated: ObjectRow = { ...row, rev: existing.rev + 1, updatedAt: Date.now() };
       const changed = await this.sql.run(`
         UPDATE objects
-        SET vault_name = ?, path_cipher = ?, content_mac = ?, size = ?, mtime = ?, updated_at = ?, encoding = ?, rev = ?
+        SET vault_name = ?, path_cipher = ?, path_mac = ?, content_mac = ?, size = ?, mtime = ?, updated_at = ?, encoding = ?, rev = ?
         WHERE account_id = ? AND file_id = ? AND rev = ?
       `, [
         updated.vaultName,
         updated.pathCipher,
+        updated.pathMac,
         updated.contentMac,
         updated.size,
         updated.mtime,
@@ -563,9 +623,9 @@ export class SyncDb {
 
   private async insertObject(row: ObjectRow): Promise<void> {
     await this.sql.run(`
-      INSERT INTO objects (account_id, file_id, vault_name, path_cipher, content_mac, size, mtime, updated_at, encoding, rev)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `, [row.accountId, row.fileId, row.vaultName, row.pathCipher, row.contentMac, row.size, row.mtime, row.updatedAt, row.encoding, row.rev]);
+      INSERT INTO objects (account_id, file_id, vault_name, path_cipher, content_mac, size, mtime, updated_at, encoding, rev, path_mac)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `, [row.accountId, row.fileId, row.vaultName, row.pathCipher, row.contentMac, row.size, row.mtime, row.updatedAt, row.encoding, row.rev, row.pathMac]);
   }
 
   async deleteObjects(accountId: string, fileIds: string[], vaultName: string): Promise<string[]> {
@@ -575,6 +635,7 @@ export class SyncDb {
       for (const fileId of fileIds) {
         const row = await this.findObject(accountId, fileId);
         if (!row || row.vaultName !== vaultName) continue;
+        await this.moveToTrash(row);
         await this.appendChange(row, "delete");
         await this.sql.run("DELETE FROM objects WHERE account_id = ? AND file_id = ?", [accountId, fileId]);
         removed.push(fileId);
@@ -593,6 +654,7 @@ export class SyncDb {
     await this.sql.exec("BEGIN");
     try {
       for (const row of rows) {
+        await this.moveToTrash(row);
         await this.appendChange(row, "delete");
         await this.sql.run("DELETE FROM objects WHERE account_id = ? AND file_id = ?", [accountId, row.fileId]);
         removed.push(row.fileId);
@@ -660,12 +722,20 @@ export class SyncDb {
     const vault = await this.findVaultById(accountId, vaultId);
     if (!vault) return undefined;
     const files = await this.listObjects(accountId, vault.name);
+    const trashed = await this.sql.all<{ file_id: string }>(
+      "SELECT file_id FROM trash WHERE account_id = ? AND vault_name = ?",
+      [accountId, vault.name],
+    );
     const versionRows = await this.sql.all<{ version_id: string; file_id: string }>(
       "SELECT version_id, file_id FROM file_versions WHERE account_id = ? AND vault_name = ?",
       [accountId, vault.name],
     );
     const versionIds = versionRows.map((row) => row.version_id);
-    const retentionIds = new Set<string>([...files.map((file) => file.fileId), ...versionRows.map((row) => row.file_id)]);
+    const retentionIds = new Set<string>([
+      ...files.map((file) => file.fileId),
+      ...trashed.map((row) => row.file_id),
+      ...versionRows.map((row) => row.file_id),
+    ]);
     await this.sql.exec("BEGIN");
     try {
       for (const fileId of retentionIds) {
@@ -677,12 +747,16 @@ export class SyncDb {
       await this.sql.run("DELETE FROM changes WHERE account_id = ? AND vault_name = ?", [accountId, vault.name]);
       await this.sql.run("DELETE FROM vault_cursors WHERE account_id = ? AND vault_name = ?", [accountId, vault.name]);
       await this.sql.run("DELETE FROM vault_policies WHERE account_id = ? AND vault_id = ?", [accountId, vaultId]);
+      await this.sql.run("DELETE FROM trash WHERE account_id = ? AND vault_name = ?", [accountId, vault.name]);
       await this.sql.exec("COMMIT");
     } catch (error) {
       await this.sql.exec("ROLLBACK");
       throw error;
     }
-    return { fileIds: files.map((file) => file.fileId), versionIds };
+    return {
+      fileIds: [...files.map((file) => file.fileId), ...trashed.map((row) => row.file_id)],
+      versionIds,
+    };
   }
 
   async deleteBlob(accountId: string, fileId: string): Promise<void> {
@@ -1013,31 +1087,31 @@ export class SyncDb {
     return Math.max(base, max + 1);
   }
 
-  async putUploadGrant(accountId: string, fileId: string, bytes: number, kind: "server" | "r2", expiresAt: number): Promise<void> {
+  async putUploadGrant(accountId: string, fileId: string, bytes: number, kind: "server" | "r2", expiresAt: number, sha256 = ""): Promise<void> {
     const existing = await this.sql.get<{ file_id: string }>(
       "SELECT file_id FROM upload_grants WHERE account_id = ? AND file_id = ?",
       [accountId, fileId],
     );
     if (existing) {
       await this.sql.run(
-        "UPDATE upload_grants SET bytes = ?, kind = ?, expires_at = ? WHERE account_id = ? AND file_id = ?",
-        [bytes, kind, expiresAt, accountId, fileId],
+        "UPDATE upload_grants SET bytes = ?, kind = ?, expires_at = ?, sha256 = ? WHERE account_id = ? AND file_id = ?",
+        [bytes, kind, expiresAt, sha256, accountId, fileId],
       );
       return;
     }
     await this.sql.run(
-      "INSERT INTO upload_grants (account_id, file_id, bytes, kind, expires_at) VALUES (?, ?, ?, ?, ?)",
-      [accountId, fileId, bytes, kind, expiresAt],
+      "INSERT INTO upload_grants (account_id, file_id, bytes, kind, expires_at, sha256) VALUES (?, ?, ?, ?, ?, ?)",
+      [accountId, fileId, bytes, kind, expiresAt, sha256],
     );
   }
 
-  async getUploadGrant(accountId: string, fileId: string): Promise<{ bytes: number; kind: "server" | "r2"; expiresAt: number } | undefined> {
-    const row = await this.sql.get<{ bytes: number | string; kind: string; expires_at: number | string }>(
-      "SELECT bytes, kind, expires_at FROM upload_grants WHERE account_id = ? AND file_id = ?",
+  async getUploadGrant(accountId: string, fileId: string): Promise<{ bytes: number; kind: "server" | "r2"; expiresAt: number; sha256: string } | undefined> {
+    const row = await this.sql.get<{ bytes: number | string; kind: string; expires_at: number | string; sha256: string | null }>(
+      "SELECT bytes, kind, expires_at, sha256 FROM upload_grants WHERE account_id = ? AND file_id = ?",
       [accountId, fileId],
     );
     if (!row || (row.kind !== "server" && row.kind !== "r2")) return undefined;
-    return { bytes: Number(row.bytes), kind: row.kind, expiresAt: Number(row.expires_at) };
+    return { bytes: Number(row.bytes), kind: row.kind, expiresAt: Number(row.expires_at), sha256: row.sha256 ?? "" };
   }
 
   async deleteUploadGrant(accountId: string, fileId: string): Promise<void> {
@@ -1114,6 +1188,257 @@ export class SyncDb {
     );
     return Number(row?.seq ?? 1);
   }
+
+  private async moveToTrash(row: ObjectRow): Promise<void> {
+    const hash = await this.getObjectHash(row.accountId, row.fileId);
+    await this.sql.run("DELETE FROM trash WHERE account_id = ? AND file_id = ?", [row.accountId, row.fileId]);
+    await this.sql.run(`
+      INSERT INTO trash (account_id, file_id, vault_name, path_cipher, content_mac, size, mtime, encoding, rev, sha256, deleted_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `, [row.accountId, row.fileId, row.vaultName, row.pathCipher, row.contentMac, row.size, row.mtime, row.encoding, row.rev, hash, Date.now()]);
+  }
+
+  async listTrash(accountId: string, vaultName: string): Promise<{ fileId: string; pathCipher: string; size: number; deletedAt: number; rev: number }[]> {
+    const rows = await this.sql.all<{ file_id: string; path_cipher: string; size: number | string; deleted_at: number | string; rev: number | string }>(
+      "SELECT file_id, path_cipher, size, deleted_at, rev FROM trash WHERE account_id = ? AND vault_name = ? ORDER BY deleted_at DESC",
+      [accountId, vaultName],
+    );
+    return rows.map((row) => ({
+      fileId: row.file_id,
+      pathCipher: row.path_cipher,
+      size: Number(row.size),
+      deletedAt: Number(row.deleted_at),
+      rev: Number(row.rev),
+    }));
+  }
+
+  async restoreTrash(accountId: string, fileId: string, vaultName: string): Promise<ObjectRow | undefined> {
+    const row = await this.sql.get<{
+      vault_name: string;
+      path_cipher: string;
+      content_mac: string;
+      size: number | string;
+      mtime: number | string;
+      encoding: string;
+      rev: number | string;
+      sha256: string | null;
+    }>(
+      "SELECT vault_name, path_cipher, content_mac, size, mtime, encoding, rev, sha256 FROM trash WHERE account_id = ? AND file_id = ?",
+      [accountId, fileId],
+    );
+    if (!row || row.vault_name !== vaultName) return undefined;
+    if (await this.findObject(accountId, fileId)) return undefined;
+    const restored: ObjectRow = {
+      accountId,
+      fileId,
+      vaultName,
+      pathCipher: row.path_cipher,
+      contentMac: row.content_mac,
+      size: Number(row.size),
+      mtime: Number(row.mtime),
+      updatedAt: Date.now(),
+      encoding: row.encoding === "plain" ? "plain" : "e2ee",
+      rev: Number(row.rev) + 1,
+      pathMac: "",
+    };
+    await this.sql.exec("BEGIN");
+    try {
+      await this.insertObject(restored);
+      await this.appendChange(restored, "upsert");
+      await this.sql.run("DELETE FROM trash WHERE account_id = ? AND file_id = ?", [accountId, fileId]);
+      if (row.sha256) await this.setObjectHash(accountId, fileId, row.sha256);
+      await this.sql.exec("COMMIT");
+    } catch (error) {
+      await this.sql.exec("ROLLBACK");
+      throw error;
+    }
+    return restored;
+  }
+
+  async purgeTrash(accountId: string, olderThan: number, maxFiles: number): Promise<string[]> {
+    const removed: string[] = [];
+    const aged = await this.sql.all<{ file_id: string }>(
+      "SELECT file_id FROM trash WHERE account_id = ? AND deleted_at < ?",
+      [accountId, olderThan],
+    );
+    for (const row of aged) {
+      await this.sql.run("DELETE FROM trash WHERE account_id = ? AND file_id = ?", [accountId, row.file_id]);
+      removed.push(row.file_id);
+    }
+    if (maxFiles > 0) {
+      const extra = await this.sql.all<{ file_id: string }>(
+        "SELECT file_id FROM trash WHERE account_id = ? ORDER BY deleted_at DESC",
+        [accountId],
+      );
+      for (const row of extra.slice(maxFiles)) {
+        await this.sql.run("DELETE FROM trash WHERE account_id = ? AND file_id = ?", [accountId, row.file_id]);
+        removed.push(row.file_id);
+      }
+    }
+    return removed;
+  }
+
+  async vaultLimits(accountId: string, vaultName: string): Promise<{ maxFiles: number; maxBytes: number }> {
+    const row = await this.sql.get<{ max_files: number | string | null; max_bytes: number | string | null }>(
+      "SELECT max_files, max_bytes FROM vault_policies WHERE account_id = ? AND vault_name = ?",
+      [accountId, vaultName],
+    );
+    return { maxFiles: Number(row?.max_files ?? 0), maxBytes: Number(row?.max_bytes ?? 0) };
+  }
+
+  async setVaultLimits(accountId: string, vaultId: string, maxFiles: number, maxBytes: number): Promise<boolean> {
+    const vault = await this.findVaultById(accountId, vaultId);
+    if (!vault) return false;
+    await this.sql.run(
+      "UPDATE vault_policies SET max_files = ?, max_bytes = ? WHERE account_id = ? AND vault_name = ?",
+      [maxFiles, maxBytes, accountId, vault.name],
+    );
+    return true;
+  }
+
+  async vaultRoom(accountId: string, vaultName: string, fileId: string, nextSize: number): Promise<string | null> {
+    const limits = await this.vaultLimits(accountId, vaultName);
+    if (limits.maxFiles <= 0 && limits.maxBytes <= 0) return null;
+    const usage = await this.sql.get<{ files: number | string; bytes: number | string | null }>(
+      "SELECT COUNT(*) AS files, COALESCE(SUM(size), 0) AS bytes FROM objects WHERE account_id = ? AND vault_name = ?",
+      [accountId, vaultName],
+    );
+    const existing = await this.findObject(accountId, fileId);
+    const sameVault = existing?.vaultName === vaultName;
+    const files = Number(usage?.files ?? 0) + (sameVault ? 0 : 1);
+    const bytes = Number(usage?.bytes ?? 0) - (sameVault ? existing.size : 0) + nextSize;
+    if (limits.maxFiles > 0 && files > limits.maxFiles) return "This vault has reached its file limit";
+    if (limits.maxBytes > 0 && bytes > limits.maxBytes) return "This vault has reached its size limit";
+    return null;
+  }
+
+  async accountPolicy(accountId: string): Promise<{ trashDays: number; trashMaxFiles: number }> {
+    const row = await this.sql.get<{ trash_days: number | string; trash_max_files: number | string }>(
+      "SELECT trash_days, trash_max_files FROM account_policies WHERE account_id = ?",
+      [accountId],
+    );
+    if (!row) return { trashDays: 30, trashMaxFiles: 200 };
+    return { trashDays: Number(row.trash_days), trashMaxFiles: Number(row.trash_max_files) };
+  }
+
+  async setAccountPolicy(accountId: string, trashDays: number, trashMaxFiles: number): Promise<void> {
+    const existing = await this.sql.get<{ account_id: string }>(
+      "SELECT account_id FROM account_policies WHERE account_id = ?",
+      [accountId],
+    );
+    if (existing) {
+      await this.sql.run(
+        "UPDATE account_policies SET trash_days = ?, trash_max_files = ? WHERE account_id = ?",
+        [trashDays, trashMaxFiles, accountId],
+      );
+      return;
+    }
+    await this.sql.run(
+      "INSERT INTO account_policies (account_id, trash_days, trash_max_files) VALUES (?, ?, ?)",
+      [accountId, trashDays, trashMaxFiles],
+    );
+  }
+
+  async listAccountIds(): Promise<string[]> {
+    const rows = await this.sql.all<{ id: string }>("SELECT id FROM accounts");
+    return rows.map((row) => row.id);
+  }
+
+  async listExpiredGrants(now: number): Promise<{ accountId: string; fileId: string }[]> {
+    const rows = await this.sql.all<{ account_id: string; file_id: string }>(
+      "SELECT account_id, file_id FROM upload_grants WHERE expires_at <= ?",
+      [now],
+    );
+    return rows.map((row) => ({ accountId: row.account_id, fileId: row.file_id }));
+  }
+
+  async setObjectHash(accountId: string, fileId: string, sha256: string): Promise<void> {
+    const existing = await this.sql.get<{ file_id: string }>(
+      "SELECT file_id FROM object_hashes WHERE account_id = ? AND file_id = ?",
+      [accountId, fileId],
+    );
+    if (existing) {
+      await this.sql.run("UPDATE object_hashes SET sha256 = ? WHERE account_id = ? AND file_id = ?", [sha256, accountId, fileId]);
+      return;
+    }
+    await this.sql.run("INSERT INTO object_hashes (account_id, file_id, sha256) VALUES (?, ?, ?)", [accountId, fileId, sha256]);
+  }
+
+  async getObjectHash(accountId: string, fileId: string): Promise<string> {
+    const row = await this.sql.get<{ sha256: string }>(
+      "SELECT sha256 FROM object_hashes WHERE account_id = ? AND file_id = ?",
+      [accountId, fileId],
+    );
+    return row?.sha256 ?? "";
+  }
+
+  async deleteObjectHash(accountId: string, fileId: string): Promise<void> {
+    await this.sql.run("DELETE FROM object_hashes WHERE account_id = ? AND file_id = ?", [accountId, fileId]);
+  }
+
+  async countLogins(): Promise<number> {
+    const row = await this.sql.get<{ n: number | string }>("SELECT COUNT(*) AS n FROM login_ids");
+    return Number(row?.n ?? 0);
+  }
+
+  async countAccounts(): Promise<number> {
+    const row = await this.sql.get<{ n: number | string }>("SELECT COUNT(*) AS n FROM accounts");
+    return Number(row?.n ?? 0);
+  }
+
+  async insertLogin(loginId: string, accountId: string, passwordHash: string, passwordSalt: string): Promise<void> {
+    await this.sql.run(
+      "INSERT INTO login_ids (login_id, account_id, password_hash, password_salt, created_at) VALUES (?, ?, ?, ?, ?)",
+      [loginId, accountId, passwordHash, passwordSalt, Date.now()],
+    );
+  }
+
+  async findLogin(loginId: string): Promise<{ loginId: string; accountId: string; passwordHash: string; passwordSalt: string } | undefined> {
+    const row = await this.sql.get<{ login_id: string; account_id: string; password_hash: string; password_salt: string }>(
+      "SELECT login_id, account_id, password_hash, password_salt FROM login_ids WHERE login_id = ?",
+      [loginId],
+    );
+    if (!row) return undefined;
+    return { loginId: row.login_id, accountId: row.account_id, passwordHash: row.password_hash, passwordSalt: row.password_salt };
+  }
+
+  async findLoginByAccount(accountId: string): Promise<{ loginId: string; accountId: string } | undefined> {
+    const row = await this.sql.get<{ login_id: string; account_id: string }>(
+      "SELECT login_id, account_id FROM login_ids WHERE account_id = ?",
+      [accountId],
+    );
+    if (!row) return undefined;
+    return { loginId: row.login_id, accountId: row.account_id };
+  }
+
+  async updateLoginPassword(loginId: string, passwordHash: string, passwordSalt: string): Promise<void> {
+    await this.sql.run(
+      "UPDATE login_ids SET password_hash = ?, password_salt = ? WHERE login_id = ?",
+      [passwordHash, passwordSalt, loginId],
+    );
+  }
+
+  async deleteLogin(loginId: string): Promise<void> {
+    await this.sql.run("DELETE FROM login_ids WHERE login_id = ?", [loginId]);
+  }
+
+  async setDisplayName(accountId: string, displayName: string): Promise<void> {
+    await this.sql.run("UPDATE accounts SET display_name = ? WHERE id = ?", [displayName, accountId]);
+  }
+
+  async listLogins(): Promise<{ loginId: string; accountId: string; displayName: string }[]> {
+    const rows = await this.sql.all<{ login_id: string; account_id: string; display_name: string | null }>(`
+      SELECT login_ids.login_id, login_ids.account_id, accounts.display_name
+      FROM login_ids LEFT JOIN accounts ON accounts.id = login_ids.account_id
+      ORDER BY login_ids.login_id
+    `);
+    return rows.map((row) => ({ loginId: row.login_id, accountId: row.account_id, displayName: row.display_name ?? "" }));
+  }
+
+  async listAccounts(): Promise<Account[]> {
+    const rows = await this.sql.all<AccountRow>("SELECT id, subject, display_name, created_at FROM accounts ORDER BY created_at");
+    return rows.map((row) => mapAccount(row)).filter((row): row is Account => Boolean(row));
+  }
 }
 
 export async function openDatabase(config: AppConfig): Promise<SyncDb> {
@@ -1146,13 +1471,24 @@ export async function openDatabase(config: AppConfig): Promise<SyncDb> {
   } catch {
     // New databases already have this column. Existing rows keep revision 1.
   }
-  for (const statement of versionColumnAlters()) {
+  for (const statement of [
+    ...versionColumnAlters(),
+    "ALTER TABLE objects ADD COLUMN path_mac VARCHAR(64) NOT NULL DEFAULT ''",
+    "ALTER TABLE api_tokens ADD COLUMN expires_at BIGINT NOT NULL DEFAULT 0",
+    "ALTER TABLE vault_policies ADD COLUMN max_files BIGINT NOT NULL DEFAULT 0",
+    "ALTER TABLE vault_policies ADD COLUMN max_bytes BIGINT NOT NULL DEFAULT 0",
+    "ALTER TABLE upload_grants ADD COLUMN sha256 VARCHAR(64) NOT NULL DEFAULT ''",
+  ]) {
     try {
       await database.exec(statement);
     } catch {
-      // New databases already have the incremental-history columns.
+      // The column is already present.
     }
   }
+  await database.run(
+    "UPDATE api_tokens SET expires_at = ? WHERE expires_at IS NULL OR expires_at = 0",
+    [Date.now() + config.sessionTtlMs],
+  );
   const missing = await database.all<{ account_id: string; vault_name: string }>(
     "SELECT account_id, vault_name FROM vault_policies WHERE vault_id IS NULL OR vault_id = ''",
   );
@@ -1316,6 +1652,38 @@ function schema(dialect: Queryable["dialect"]): string[] {
       device_code VARCHAR(128) NOT NULL,
       expires_at BIGINT NOT NULL
     )`,
+    `CREATE TABLE IF NOT EXISTS login_ids (
+      login_id VARCHAR(32) PRIMARY KEY,
+      account_id VARCHAR(64) NOT NULL UNIQUE,
+      password_hash VARCHAR(128) NOT NULL,
+      password_salt VARCHAR(64) NOT NULL,
+      created_at BIGINT NOT NULL
+    )`,
+    `CREATE TABLE IF NOT EXISTS account_policies (
+      account_id VARCHAR(64) PRIMARY KEY,
+      trash_days INTEGER NOT NULL DEFAULT 30,
+      trash_max_files INTEGER NOT NULL DEFAULT 200
+    )`,
+    `CREATE TABLE IF NOT EXISTS trash (
+      account_id VARCHAR(64) NOT NULL,
+      file_id VARCHAR(64) NOT NULL,
+      vault_name VARCHAR(200) NOT NULL,
+      path_cipher ${large} NOT NULL,
+      content_mac VARCHAR(64) NOT NULL,
+      size BIGINT NOT NULL,
+      mtime BIGINT NOT NULL,
+      encoding VARCHAR(16) NOT NULL,
+      rev BIGINT NOT NULL,
+      sha256 VARCHAR(64) NOT NULL DEFAULT '',
+      deleted_at BIGINT NOT NULL,
+      PRIMARY KEY (account_id, file_id)
+    )`,
+    `CREATE TABLE IF NOT EXISTS object_hashes (
+      account_id VARCHAR(64) NOT NULL,
+      file_id VARCHAR(64) NOT NULL,
+      sha256 VARCHAR(64) NOT NULL,
+      PRIMARY KEY (account_id, file_id)
+    )`,
   ];
 }
 
@@ -1346,6 +1714,7 @@ function mapObject(row: ObjectSqlRow): ObjectRow {
     updatedAt: Number(row.updated_at),
     encoding: row.encoding === "plain" ? "plain" : "e2ee",
     rev: Number.isSafeInteger(rev) && rev > 0 ? rev : 1,
+    pathMac: row.path_mac ?? "",
   };
 }
 
