@@ -1,5 +1,5 @@
 import { requestUrl, type RequestUrlResponse } from "obsidian";
-import type { RetentionView, VersionDownload, VersionListResponse } from "../../shared/src/history";
+import type { FlushWindow, RetentionView, SyncTrigger, VersionDownload, VersionKind, VersionListResponse } from "../../shared/src/history";
 import {
   normalizeHost,
   remoteRev,
@@ -111,8 +111,13 @@ export class SyncClient {
   async putObject(
     fileId: string,
     payload: ObjectPayload,
-    history?: { syncTrigger?: "auto" | "manual"; autoLimit?: number },
-  ): Promise<PutResult> {
+    history?: {
+      syncTrigger?: SyncTrigger;
+      autoLimit?: number;
+      historyKind?: VersionKind;
+      patchCipher?: PayloadCipher;
+    },
+  ): Promise<PutResult & { versionId?: string; historyKind?: VersionKind; flush?: FlushWindow }> {
     const content = JSON.stringify(payload.contentCipher);
     const bytes = new TextEncoder().encode(content).byteLength;
     const parentRev = payload.parentRev ?? null;
@@ -143,6 +148,8 @@ export class SyncClient {
       blobBytes: bytes,
       ...(history?.syncTrigger ? { syncTrigger: history.syncTrigger } : {}),
       ...(typeof history?.autoLimit === "number" ? { autoLimit: history.autoLimit } : {}),
+      ...(history?.historyKind ? { historyKind: history.historyKind } : {}),
+      ...(history?.patchCipher ? { patchCipher: history.patchCipher } : {}),
     }), this.onRetry));
     const body = response.json as Partial<ConflictBody & PutResult> | null;
     if (response.status === 401) throw new SessionExpiredError();
@@ -158,7 +165,55 @@ export class SyncClient {
       encoding: body?.encoding === "plain" || body?.encoding === "e2ee" ? body.encoding : payload.encoding,
       size: typeof body?.size === "number" ? body.size : payload.size,
       updatedAt: typeof body?.updatedAt === "number" ? body.updatedAt : Date.now(),
+      ...readHistory(body),
     };
+  }
+
+  async putCheckpoint(
+    fileId: string,
+    body: {
+      vault: string;
+      vaultId: string;
+      contentCipher: PayloadCipher;
+      contentMac: string;
+      size: number;
+      mtime: number;
+      encoding: "e2ee" | "plain";
+      tipRev: number;
+      syncTrigger: SyncTrigger;
+    },
+  ): Promise<{ versionId: string; flush?: FlushWindow }> {
+    const response = await send("POST", `${this.host}/api/v1/files/${fileId}/checkpoints`, {
+      authorization: `Bearer ${this.token}`,
+      "content-type": "application/json; charset=utf-8",
+    }, JSON.stringify({
+      vault: body.vault,
+      vaultId: body.vaultId,
+      contentCipher: body.contentCipher,
+      contentMac: body.contentMac,
+      size: body.size,
+      mtime: body.mtime,
+      encoding: body.encoding,
+      tipRev: body.tipRev,
+      syncTrigger: body.syncTrigger,
+    }), this.onRetry);
+    const parsed = response.json as Partial<ConflictBody & { versionId?: unknown; flush?: unknown }> | null;
+    if (response.status === 409 && parsed && (parsed.reason === "parent_rev" || parsed.reason === "deleted")) {
+      throw new SyncConflictError(parsed.reason, conflictFile(parsed.file));
+    }
+    if (response.status >= 400) throw new Error(errorMessage(response));
+    return {
+      versionId: typeof parsed?.versionId === "string" ? parsed.versionId : "",
+      flush: readFlush(parsed?.flush),
+    };
+  }
+
+  historyFlush(
+    vaultId: string,
+    syncTrigger: SyncTrigger = "auto",
+  ): Promise<{ files: { fileId: string; pendingCount: number; pendingBytes: number; earliest: number | null; reason: string }[] }> {
+    const query = syncTrigger === "manual" ? "?syncTrigger=manual" : "";
+    return this.authed("GET", `/api/v1/vaults/${encodeURIComponent(vaultId)}/history-flush${query}`);
   }
 
   async getObject(fileId: string, vaultId: string): Promise<ObjectPayload> {
@@ -346,6 +401,31 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => {
     window.setTimeout(resolve, ms);
   });
+}
+
+function readHistory(value: unknown): { versionId?: string; historyKind?: VersionKind; flush?: FlushWindow } {
+  if (!value || typeof value !== "object") return {};
+  const body = value as { versionId?: unknown; historyKind?: unknown; flush?: unknown };
+  const flush = readFlush(body.flush);
+  return {
+    ...(typeof body.versionId === "string" ? { versionId: body.versionId } : {}),
+    ...(body.historyKind === "delta" || body.historyKind === "checkpoint" ? { historyKind: body.historyKind } : {}),
+    ...(flush ? { flush } : {}),
+  };
+}
+
+function readFlush(value: unknown): FlushWindow | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const body = value as Partial<FlushWindow>;
+  if (typeof body.due !== "boolean") return undefined;
+  const reason = body.reason;
+  return {
+    pendingCount: typeof body.pendingCount === "number" ? body.pendingCount : 0,
+    pendingBytes: typeof body.pendingBytes === "number" ? body.pendingBytes : 0,
+    earliest: typeof body.earliest === "number" ? body.earliest : null,
+    due: body.due,
+    reason: reason === "count" || reason === "bytes" || reason === "age" || reason === "manual" || reason === "restore" ? reason : null,
+  };
 }
 
 function normalizeUrlList(value: UrlListResponse): UrlListResponse {

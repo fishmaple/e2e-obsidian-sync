@@ -1,5 +1,6 @@
 import { Notice, Plugin, TFile, type ObsidianProtocolData } from "obsidian";
 import { clampAutoVersionLimit } from "../../shared/src/history";
+import { normalizeCheckpointRetries, type CheckpointRetry } from "./checkpoint-retry";
 import { MIN_SECRET_LENGTH } from "../../shared/src/protocol";
 import { SyncClient, SessionExpiredError, exchangeLogin, resolveSyncHost } from "./client";
 import { clampMaxFileBytes, clampNonNegative, clampTrashDays } from "./limits";
@@ -59,6 +60,8 @@ export interface SyncSettings {
   autoVersionLimit: number;
   /** Per-file auto retention overrides. Manual caps stay on the server. */
   versionLimitOverrides: Record<string, number>;
+  /** Checkpoints that failed after the tip was stored. One latest tip per file. */
+  checkpointRetries: Record<string, CheckpointRetry>;
   syncSuffixes: string[];
   customSuffixes: string[];
   syncOther: boolean;
@@ -94,6 +97,7 @@ const DEFAULT_SETTINGS: SyncSettings = {
   conflictPolicy: "snapshot",
   autoVersionLimit: 100,
   versionLimitOverrides: {},
+  checkpointRetries: {},
   syncSuffixes: allSuffixes(),
   customSuffixes: [],
   syncOther: true,
@@ -239,6 +243,7 @@ export default class E2eeSyncPlugin extends Plugin {
     const storedLimit = rest.autoVersionLimit;
     this.settings.autoVersionLimit = clampAutoVersionLimit(typeof storedLimit === "number" ? storedLimit : 100);
     this.settings.versionLimitOverrides = normalizeVersionLimits(rest.versionLimitOverrides);
+    this.settings.checkpointRetries = normalizeCheckpointRetries(rest.checkpointRetries);
     const known = new Set(allSuffixes());
     const storedCustom = rest.customSuffixes;
     const custom = Array.isArray(storedCustom)

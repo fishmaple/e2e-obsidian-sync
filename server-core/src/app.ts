@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { Hono, type Context } from "hono";
 import { bytesToBase64Url, randomBytes } from "../../shared/src/codec";
+import { flushReasonForSync } from "../../shared/src/history";
 import {
   DEVICE_TTL_MS,
   MAX_BODY_BYTES,
@@ -14,12 +15,12 @@ import {
   type RemoteFile,
 } from "../../shared/src/protocol";
 import type { AppConfig } from "./config";
-import type { ObjectRow, SyncDb } from "./db";
+import { TipMovedError, type ObjectRow, type SyncDb } from "./db";
 import { HttpError } from "./http-error";
 import { accessPage, accountPage, adminPage, homePage, installPage, installPs1, installSh, loginPage, messagePage, obsidianReturnPage } from "./html";
 import { createBlobStore } from "./storage";
 import { acceptServerUpload, directRequestValid, discardUpload, finishUpload, listTransferUrls, listVersionDownloads, serverDownload, serverVersionDownload, versionRequestValid } from "./urls";
-import { assertVersionId, forgetVersionBlobs, parseHistoryOptions, parseRetentionBody, rememberVersion, retentionFor, toVersionInfo } from "./versions";
+import { assertVersionId, forgetVersionBlobs, historyResponse, parseCheckpointUpload, parseHistoryOptions, parseRetentionBody, recordHistory, retentionFor, storeUploadedCheckpoint, toVersionInfo } from "./versions";
 import { completeOidcLogin, createOidcRequest } from "./oidc";
 import { clearCookieHeader, openSession, readCookie, sealSession, sessionCookieName, setCookieHeader } from "./session";
 import { hashPassword, randomPassword, validLoginId, verifyPassword } from "./passwords";
@@ -448,7 +449,7 @@ export function createApp(deps: AppDeps): Hono {
     const { accountId } = await requireToken(c);
     const commitBody = parseJson(await readBody(c));
     const payload = parseCommitPayload(commitBody, config.requireEncryption);
-    const history = parseHistoryOptions(commitBody);
+    const history = parseHistoryOptions(commitBody, payload.encoding, config.requireEncryption);
     const named = payload.vaultId ? await db.findVaultById(accountId, payload.vaultId) : undefined;
     if (payload.vaultId && !named) throw new HttpError(404, "The remote vault does not exist");
     const vaultName = named?.name ?? payload.vault;
@@ -472,13 +473,13 @@ export function createApp(deps: AppDeps): Hono {
       encoding: payload.encoding,
     }, payload.parentRev ?? null, async () => {
       await finishUpload(config, db, blobs, accountId, fileId, payload.encoding);
-    }, payload.renamed === true, rememberVersion(db, blobs, history));
+    }, payload.renamed === true, recordHistory(db, blobs, history));
     try {
       await discardUpload(config, db, accountId, fileId);
     } catch {
       console.error("Failed to clear an upload slot");
     }
-    if (result.status !== "conflict") await forgetVersionBlobs(blobs, accountId, result.droppedVersionIds);
+    if (result.status !== "conflict") await forgetVersionBlobs(blobs, accountId, result.history.droppedVersionIds);
     if (result.status === "conflict") {
       const deleted = result.reason === "deleted";
       return c.json({
@@ -498,6 +499,7 @@ export function createApp(deps: AppDeps): Hono {
       encoding: result.row.encoding,
       size: result.row.size,
       updatedAt: result.row.updatedAt,
+      ...historyResponse(result.history),
     });
   });
 
@@ -551,6 +553,12 @@ export function createApp(deps: AppDeps): Hono {
     }
     c.header("content-type", "application/json; charset=utf-8");
     c.header("cache-control", "no-store");
+    const version = await db.findFileVersion(accountId, versionId);
+    if (version?.kind === "delta") {
+      const patch = await db.getPatch(accountId, versionId);
+      if (!patch) throw new HttpError(404, "This version was folded into a checkpoint");
+      return c.body(patch);
+    }
     return c.body(await serverVersionDownload(blobs, accountId, versionId));
   });
 
@@ -561,7 +569,7 @@ export function createApp(deps: AppDeps): Hono {
     const { accountId } = await requireToken(c);
     const objectBody = parseJson(raw);
     const payload = parseObjectPayload(objectBody, config.requireEncryption);
-    const history = parseHistoryOptions(objectBody);
+    const history = parseHistoryOptions(objectBody, payload.encoding, config.requireEncryption);
     const named = payload.vaultId ? await db.findVaultById(accountId, payload.vaultId) : undefined;
     if (payload.vaultId && !named) throw new HttpError(404, "The remote vault does not exist");
     const vaultName = named?.name ?? payload.vault;
@@ -582,8 +590,8 @@ export function createApp(deps: AppDeps): Hono {
       encoding: payload.encoding,
     }, payload.parentRev ?? null, async () => {
       await blobs.put(accountId, fileId, JSON.stringify(payload.contentCipher));
-    }, payload.renamed === true, rememberVersion(db, blobs, history));
-    if (result.status !== "conflict") await forgetVersionBlobs(blobs, accountId, result.droppedVersionIds);
+    }, payload.renamed === true, recordHistory(db, blobs, history));
+    if (result.status !== "conflict") await forgetVersionBlobs(blobs, accountId, result.history.droppedVersionIds);
     if (result.status === "conflict") {
       const deleted = result.reason === "deleted";
       return c.json({
@@ -603,6 +611,7 @@ export function createApp(deps: AppDeps): Hono {
       encoding: result.row.encoding,
       size: result.row.size,
       updatedAt: result.row.updatedAt,
+      ...historyResponse(result.history),
     });
   });
 
@@ -798,6 +807,9 @@ export function createApp(deps: AppDeps): Hono {
     if (!version || version.fileId !== fileId || version.vaultName !== vaultName) {
       throw new HttpError(404, "This version is not on the server");
     }
+    if (version.kind === "delta") {
+      throw new HttpError(409, "This change is stored as a patch. Restore it from a device that can decrypt the vault");
+    }
     const parentRev = parseParentRev(body);
     const result = await db.putObjectRevision({
       accountId,
@@ -811,8 +823,8 @@ export function createApp(deps: AppDeps): Hono {
       encoding: version.encoding,
     }, parentRev, async () => {
       await blobs.put(accountId, fileId, await blobs.getVersion(accountId, versionId));
-    }, false, rememberVersion(db, blobs, { syncTrigger: "restore" }));
-    if (result.status !== "conflict") await forgetVersionBlobs(blobs, accountId, result.droppedVersionIds);
+    }, false, recordHistory(db, blobs, { syncTrigger: "restore", kind: "checkpoint" }));
+    if (result.status !== "conflict") await forgetVersionBlobs(blobs, accountId, result.history.droppedVersionIds);
     if (result.status === "conflict") {
       const deleted = result.reason === "deleted";
       return c.json({
@@ -831,7 +843,98 @@ export function createApp(deps: AppDeps): Hono {
       encoding: result.row.encoding,
       size: result.row.size,
       updatedAt: result.row.updatedAt,
+      ...historyResponse(result.history),
     });
+  });
+
+  api.post("/files/:fileId/checkpoints", async (c) => {
+    const fileId = c.req.param("fileId");
+    if (!FILE_ID.test(fileId)) throw new HttpError(400, "Invalid file ID");
+    const { accountId } = await requireToken(c);
+    const body = parseJson(await readBody(c));
+    const upload = parseCheckpointUpload(body, config.requireEncryption);
+    const requested = body as { vault?: unknown; vaultId?: unknown };
+    const vaultKey = typeof requested.vaultId === "string" && requested.vaultId
+      ? requested.vaultId
+      : typeof requested.vault === "string" ? requested.vault : undefined;
+    const vaultName = await vaultNameFromQuery(accountId, vaultKey);
+    const tip = await db.findObject(accountId, fileId);
+    if (!tip || tip.vaultName !== vaultName) throw new HttpError(404, "This file is not on the server");
+    if (tip.rev !== upload.tipRev || tip.contentMac !== upload.contentMac || tip.encoding !== upload.encoding || tip.size !== upload.size) {
+      return c.json({
+        error: "The remote copy changed since this device last synced",
+        reason: "parent_rev",
+        file: toRemoteFile(tip),
+      }, 409);
+    }
+    const retained = await retentionFor(db, accountId, fileId);
+    let history;
+    try {
+      history = await storeUploadedCheckpoint(
+        db,
+        blobs,
+        tip,
+        upload.syncTrigger,
+        JSON.stringify(upload.contentCipher),
+        retained.autoLimit,
+      );
+    } catch (error) {
+      if (error instanceof TipMovedError) {
+        return c.json({
+          error: "The remote copy changed since this device last synced",
+          reason: "parent_rev",
+          file: error.current ? toRemoteFile(error.current) : null,
+        }, 409);
+      }
+      throw error;
+    }
+    await forgetVersionBlobs(blobs, accountId, history.droppedVersionIds);
+    return c.json({
+      ok: true,
+      versionId: history.versionId,
+      historyKind: history.historyKind,
+      flush: history.flush,
+      rev: tip.rev,
+      contentMac: tip.contentMac,
+    });
+  });
+
+  api.get("/vaults/:vaultId/history-flush", async (c) => {
+    const { accountId } = await requireToken(c);
+    const vaultId = c.req.param("vaultId").trim();
+    if (!/^[0-9a-f-]{36}$/i.test(vaultId)) throw new HttpError(400, "Invalid vault id");
+    const vault = await db.findVaultById(accountId, vaultId);
+    if (!vault) throw new HttpError(404, "The remote vault does not exist");
+    const trigger = parseFlushTrigger(c.req.query("syncTrigger") ?? c.req.query("sync_trigger"));
+    const grouped = new Map<string, { size: number; patchBytes: number; createdAt: number }[]>();
+    for (const row of await db.listUnsealedDeltas(accountId, vault.name)) {
+      const list = grouped.get(row.fileId);
+      const stat = { size: row.size, patchBytes: row.patchBytes, createdAt: row.createdAt };
+      if (list) list.push(stat);
+      else grouped.set(row.fileId, [stat]);
+    }
+    const files: {
+      fileId: string;
+      pendingCount: number;
+      pendingBytes: number;
+      earliest: number | null;
+      reason: string;
+    }[] = [];
+    const now = Date.now();
+    const limit = trigger === "manual" ? 20000 : 100;
+    for (const [fileId, pending] of grouped) {
+      const flush = flushReasonForSync(pending, now, trigger);
+      if (!flush.due || !flush.reason) continue;
+      files.push({
+        fileId,
+        pendingCount: flush.pendingCount,
+        pendingBytes: flush.pendingBytes,
+        earliest: flush.earliest,
+        reason: flush.reason,
+      });
+      if (files.length >= limit) break;
+    }
+    return c.json({ files });
   });
 
   api.post("/vaults/:vaultId/plaintext-history", async (c) => {
@@ -1145,6 +1248,12 @@ function parseLimit(value: string | undefined): number {
   const limit = Number(value);
   if (!Number.isSafeInteger(limit) || limit < 1) throw new HttpError(400, "Invalid changes limit");
   return Math.min(5000, limit);
+}
+
+function parseFlushTrigger(value: string | undefined): "auto" | "manual" {
+  if (value === undefined || value === "" || value === "auto") return "auto";
+  if (value === "manual") return "manual";
+  throw new HttpError(400, "Invalid sync trigger");
 }
 
 function parseVaultName(value: string | undefined): string {
