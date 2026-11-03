@@ -105,6 +105,11 @@
   width: min(760px, 94vw);
 }
 
+.e2ee-sync-history-modal button:disabled,
+.e2ee-sync-history-modal input:disabled {
+  opacity: 0.45;
+}
+
 .e2ee-sync-days {
   display: grid;
   gap: 8px;

@@ -13,6 +13,7 @@ import {
   reconstructPlan,
   diffVersionText,
   groupVersionsByDay,
+  historyNodeAccess,
   previousChangedDayPair,
   type FileVersionInfo,
 } from "./history";
@@ -197,6 +198,10 @@ test("reconstruction walks a checkpoint plus open deltas and refuses a sealed ga
   assert.deepEqual(reconstructPlan(versions, sealed.versionId), { mode: "sealed" });
   assert.deepEqual(reconstructPlan(versions, sameMac.versionId), { mode: "full", versionId: folded.versionId });
   assert.equal(reconstructPlan(versions, "0".repeat(64)).mode, "missing");
+  assert.deepEqual(historyNodeAccess(versions, checkpoint), { sealed: false, comparable: true });
+  assert.deepEqual(historyNodeAccess(versions, open), { sealed: false, comparable: true });
+  assert.deepEqual(historyNodeAccess(versions, sealed), { sealed: true, comparable: false });
+  assert.deepEqual(historyNodeAccess(versions, sameMac), { sealed: true, comparable: true });
 });
 
 test("version text diff marks inserted and removed lines", () => {

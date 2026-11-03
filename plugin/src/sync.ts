@@ -5,6 +5,14 @@ import { clampAutoVersionLimit, planHistoryKind, type SyncTrigger } from "../../
 import { bodyAad, diffBytes, patchAad } from "../../shared/src/patch";
 import { MIN_SECRET_LENGTH, remoteRev, type ChangeEntry, type Encoding, type PayloadCipher, type PutResult, type RemoteFile, type VaultStat } from "../../shared/src/protocol";
 import { decideSyncAction } from "../../shared/src/reconcile";
+import {
+  checkpointCountsMatter,
+  checkpointFailureKind,
+  emptyCheckpointCounts,
+  forgetCheckpointRetry,
+  rememberCheckpointRetry,
+  type CheckpointFlushCounts,
+} from "./checkpoint-retry";
 import { SyncClient, SyncConflictError, fetchBootstrap, openExternal, resolveSyncHost } from "./client";
 import { askConflict, type ConflictChoice, type ConflictView } from "./conflict";
 import { excludedPath } from "./exclude";
@@ -73,8 +81,25 @@ export function propagatePlugin(plugin: E2eeSyncPlugin): string[] {
   return installed;
 }
 
+interface CheckpointRun {
+  plugin: E2eeSyncPlugin;
+  counts: CheckpointFlushCounts;
+  tried: Set<string>;
+}
+
+let activeCheckpointRun: CheckpointRun | null = null;
+
 export async function pushVault(plugin: E2eeSyncPlugin, trigger: "auto" | "manual"): Promise<string> {
   const ready = await openBoundClient(plugin, trigger);
+  activeCheckpointRun = { plugin, counts: emptyCheckpointCounts(), tried: new Set() };
+  try {
+  return await runVaultSync(plugin, ready);
+  } finally {
+    activeCheckpointRun = null;
+  }
+}
+
+async function runVaultSync(plugin: E2eeSyncPlugin, ready: ReadyClient): Promise<string> {
   await ready.client.putPolicy({
     trashDays: plugin.settings.trashDays,
     trashMaxFiles: plugin.settings.trashMaxFiles,
@@ -304,14 +329,17 @@ export async function pushVault(plugin: E2eeSyncPlugin, trigger: "auto" | "manua
   const deleted = removed ? t("deleted", { n: removed }) : "";
   const resolvedNote = resolved ? t("conflictsResolved", { n: resolved }) : "";
   const leftNote = unresolved ? t("conflictsLeft", { n: unresolved }) : "";
+  const flushCounts = activeCheckpointRun?.counts ?? emptyCheckpointCounts();
+  const flushNote = checkpointCountsMatter(flushCounts) ? t("historyFlushSummary", { ...flushCounts }) : "";
   plugin.settings.lastSyncSummary = t("summary", {
     vault: ready.vaultName,
     uploaded,
     downloaded,
     unchanged,
-    large: `${deleted}${large}${resolvedNote}${leftNote}`,
+    large: `${deleted}${large}${resolvedNote}${leftNote}${flushNote}`,
   });
   await plugin.saveSettings();
+  if (flushCounts.failed > 0) new Notice(t("historyFlushFailed", { n: flushCounts.failed }));
   return plugin.settings.lastSyncSummary;
 }
 
@@ -467,13 +495,15 @@ async function putFile(
     parentRev,
   }, history);
   if (history.historyKind === "delta" && result.historyKind !== "checkpoint" && result.flush?.due && result.rev > 0) {
-    await storeCheckpoint(ready, fileId, contentCipher, {
+    const tip = {
       rev: result.rev,
       contentMac: result.contentMac,
       size: result.size,
       mtime: result.mtime,
       encoding: result.encoding,
-    });
+    };
+    const outcome = await storeCheckpoint(ready, fileId, contentCipher, tip);
+    noteCheckpoint(outcome, fileId, tip, history.syncTrigger);
   }
   return result;
 }
@@ -505,13 +535,44 @@ async function historyUpload(
   }
 }
 
+type CheckpointTip = { rev: number; contentMac: string; size: number; mtime: number; encoding: Encoding };
+type CheckpointOutcome = "flushed" | "skippedDiverged" | "skippedTipMoved" | "failed";
+
+function noteCheckpoint(
+  outcome: CheckpointOutcome,
+  fileId: string,
+  tip?: CheckpointTip,
+  syncTrigger: SyncTrigger = "auto",
+): void {
+  const run = activeCheckpointRun;
+  if (!run) return;
+  run.tried.add(fileId);
+  run.counts[outcome] += 1;
+  const queue = run.plugin.settings.checkpointRetries;
+  if (outcome === "failed" && tip && tip.rev > 0) {
+    run.plugin.settings.checkpointRetries = rememberCheckpointRetry(queue, {
+      fileId,
+      tipRev: tip.rev,
+      contentMac: tip.contentMac,
+      size: tip.size,
+      mtime: tip.mtime,
+      encoding: tip.encoding,
+      syncTrigger,
+    });
+    return;
+  }
+  if (outcome !== "failed") {
+    run.plugin.settings.checkpointRetries = forgetCheckpointRetry(queue, fileId);
+  }
+}
+
 async function storeCheckpoint(
   ready: ReadyClient,
   fileId: string,
   contentCipher: PayloadCipher,
-  tip: { rev: number; contentMac: string; size: number; mtime: number; encoding: Encoding },
+  tip: CheckpointTip,
   syncTrigger: SyncTrigger = "auto",
-): Promise<void> {
+): Promise<Exclude<CheckpointOutcome, "skippedDiverged">> {
   try {
     await ready.client.putCheckpoint(fileId, {
       vault: ready.vaultName,
@@ -524,8 +585,11 @@ async function storeCheckpoint(
       tipRev: tip.rev,
       syncTrigger,
     });
+    return "flushed";
   } catch (error) {
-    console.warn("Could not store a history checkpoint", error);
+    const kind = checkpointFailureKind(error);
+    if (kind === "failed") console.warn("Could not store a history checkpoint", error);
+    return kind;
   }
 }
 
@@ -534,37 +598,94 @@ async function flushDueCheckpoints(
   ready: ReadyClient,
   index: Record<string, FileIndexEntry>,
 ): Promise<void> {
+  await retryQueuedCheckpoints(plugin, ready, index);
   let due: { files?: { fileId: string }[] };
   try {
     due = await ready.client.historyFlush(ready.vaultId, ready.syncTrigger);
   } catch (error) {
     console.warn("Could not list history checkpoints that are due", error);
+    const run = activeCheckpointRun;
+    if (run) run.counts.failed += 1;
     return;
   }
   for (const item of due.files ?? []) {
+    if (activeCheckpointRun?.tried.has(item.fileId)) continue;
     const entry = index[item.fileId];
-    if (!entry || typeof entry.rev !== "number" || entry.rev < 1) continue;
+    if (!entry || typeof entry.rev !== "number" || entry.rev < 1) {
+      noteCheckpoint("skippedDiverged", item.fileId);
+      continue;
+    }
     const file = plugin.app.vault.getAbstractFileByPath(entry.path);
-    if (!(file instanceof TFile)) continue;
+    if (!(file instanceof TFile)) {
+      noteCheckpoint("skippedDiverged", item.fileId);
+      continue;
+    }
+    const tip: CheckpointTip = {
+      rev: entry.rev,
+      contentMac: entry.contentMac,
+      size: entry.size,
+      mtime: entry.mtime,
+      encoding: entry.encoding === "plain" ? "plain" : "e2ee",
+    };
     try {
       const plain = new Uint8Array(await plugin.app.vault.readBinary(file));
       const mac = await fingerprint(ready, plain);
-      if (mac !== entry.contentMac) continue;
-      const encoding: Encoding = entry.encoding === "plain" || entry.encoding === "e2ee"
-        ? entry.encoding
-        : (ready.keys ? "e2ee" : "plain");
+      if (mac !== entry.contentMac) {
+        noteCheckpoint("skippedDiverged", item.fileId);
+        continue;
+      }
       const contentCipher = ready.keys
         ? await sealBytes(ready.keys.encKey, plain, bodyAad(item.fileId), true)
         : { v: 0 as const, raw: bytesToBase64(plain) };
-      await storeCheckpoint(ready, item.fileId, contentCipher, {
-        rev: entry.rev,
+      const outcome = await storeCheckpoint(ready, item.fileId, contentCipher, {
+        ...tip,
         contentMac: mac,
         size: plain.byteLength,
-        mtime: entry.mtime,
-        encoding,
       }, ready.syncTrigger);
+      noteCheckpoint(outcome, item.fileId, { ...tip, contentMac: mac, size: plain.byteLength }, ready.syncTrigger);
     } catch (error) {
       console.warn("Could not checkpoint an aged history window", error);
+      noteCheckpoint("failed", item.fileId, tip, ready.syncTrigger);
+    }
+  }
+}
+
+async function retryQueuedCheckpoints(
+  plugin: E2eeSyncPlugin,
+  ready: ReadyClient,
+  index: Record<string, FileIndexEntry>,
+): Promise<void> {
+  const queued = Object.values(plugin.settings.checkpointRetries ?? {});
+  for (const retry of queued) {
+    activeCheckpointRun?.tried.add(retry.fileId);
+    const entry = index[retry.fileId];
+    const file = entry ? plugin.app.vault.getAbstractFileByPath(entry.path) : null;
+    const tip: CheckpointTip = {
+      rev: retry.tipRev,
+      contentMac: retry.contentMac,
+      size: retry.size,
+      mtime: retry.mtime,
+      encoding: retry.encoding,
+    };
+    if (!(file instanceof TFile) || !entry || entry.rev !== retry.tipRev || entry.contentMac !== retry.contentMac) {
+      noteCheckpoint("skippedDiverged", retry.fileId);
+      continue;
+    }
+    try {
+      const plain = new Uint8Array(await plugin.app.vault.readBinary(file));
+      const mac = await fingerprint(ready, plain);
+      if (mac !== retry.contentMac) {
+        noteCheckpoint("skippedDiverged", retry.fileId);
+        continue;
+      }
+      const contentCipher = ready.keys
+        ? await sealBytes(ready.keys.encKey, plain, bodyAad(retry.fileId), true)
+        : { v: 0 as const, raw: bytesToBase64(plain) };
+      const outcome = await storeCheckpoint(ready, retry.fileId, contentCipher, tip, retry.syncTrigger);
+      noteCheckpoint(outcome, retry.fileId, tip, retry.syncTrigger);
+    } catch (error) {
+      console.warn("Could not retry a history checkpoint", error);
+      noteCheckpoint("failed", retry.fileId, tip, retry.syncTrigger);
     }
   }
 }

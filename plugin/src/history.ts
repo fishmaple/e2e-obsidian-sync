@@ -5,6 +5,7 @@ import {
   clampAutoVersionLimit,
   diffVersionText,
   groupVersionsByDay,
+  historyNodeAccess,
   previousChangedDayPair,
   reconstructPlan,
   type FileVersionInfo,
@@ -151,16 +152,25 @@ export class FileHistoryModal extends Modal {
   }
 
   private versionRow(parent: HTMLElement, version: FileVersionInfo): void {
+    const access = historyNodeAccess(this.versions, version);
     const row = parent.createDiv({ cls: "e2ee-sync-version" });
     const input = row.createEl("input", { type: "checkbox" });
     input.checked = this.selected.includes(version.versionId);
+    input.disabled = !access.comparable;
+    if (!access.comparable) input.title = t("historySealed");
     input.onchange = () => {
       this.toggle(version.versionId);
       this.render();
     };
     row.createSpan({ text: versionLabel(version) });
     const restore = row.createEl("button", { text: t("historyRestore") });
+    restore.disabled = access.sealed;
+    if (access.sealed) restore.title = t("historySealed");
     restore.onclick = () => {
+      if (access.sealed) {
+        new Notice(t("historySealed"));
+        return;
+      }
       new RestoreVersionConfirm(this.app, () => { void this.restore(version); }).open();
     };
   }
@@ -216,6 +226,10 @@ export class FileHistoryModal extends Modal {
   }
 
   private async compare(older: FileVersionInfo, newer: FileVersionInfo): Promise<void> {
+    if (!historyNodeAccess(this.versions, older).comparable || !historyNodeAccess(this.versions, newer).comparable) {
+      new Notice(t("historySealed"));
+      return;
+    }
     try {
       const [left, right] = await Promise.all([this.plainText(older), this.plainText(newer)]);
       if (left === null || right === null) {
@@ -362,8 +376,9 @@ function versionLabel(version: FileVersionInfo): string {
     ? t("historyManual")
     : version.syncTrigger === "restore" ? t("historyRestoreTrigger") : t("historyAuto");
   const kind = version.kind === "delta" ? t("historyDelta") : t("historyCheckpoint");
+  const folded = version.kind === "delta" && version.sealed ? ` · ${t("historyFolded")}` : "";
   const encoding = version.encoding === "plain" ? t("historyPlain") : t("historyEncrypted");
-  return `${clock(version.createdAt)} · ${trigger} · ${kind} · ${encoding} · ${formatBytes(version.size)} · rev ${version.tipRev}`;
+  return `${clock(version.createdAt)} · ${trigger} · ${kind}${folded} · ${encoding} · ${formatBytes(version.size)} · rev ${version.tipRev}`;
 }
 
 function clock(ms: number): string {

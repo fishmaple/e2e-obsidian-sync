@@ -222,11 +222,20 @@ export function historyVersionsToDrop(versions: readonly HistoryRetentionNode[],
 }
 
 /**
- * How to rebuild one version on the client.
- * A checkpoint is fetched whole. An open delta walks back to a checkpoint and
- * applies patches. A sealed delta whose patch was deleted is readable only when
- * some checkpoint still has the same content fingerprint.
+ * Sealed deltas stay in the day list but cannot be restored.
+ * Compare stays available only when the text can still be rebuilt, usually
+ * because a checkpoint still has the same content fingerprint.
  */
+export function historyNodeAccess(
+  versions: readonly FileVersionInfo[],
+  version: FileVersionInfo,
+): { sealed: boolean; comparable: boolean } {
+  const sealed = version.kind === "delta" && version.sealed === true;
+  if (!sealed) return { sealed: false, comparable: true };
+  const plan = reconstructPlan(versions, version.versionId);
+  return { sealed: true, comparable: plan.mode === "full" || plan.mode === "chain" };
+}
+
 export function reconstructPlan(versions: readonly FileVersionInfo[], targetId: string): ReconstructPlan {
   const byId = new Map(versions.map((version) => [version.versionId, version]));
   const target = byId.get(targetId);
