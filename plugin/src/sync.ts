@@ -22,6 +22,7 @@ import { t } from "./i18n";
 import { isDesktopApp, obsidianConfigDir, warnMissingObsidianConfig } from "./obsidian-dir";
 import type E2eeSyncPlugin from "./main";
 import type { FileIndexEntry } from "./main";
+import { conflictPolicyForPass, normalizeSyncMode, planDisposition, type SyncPass } from "./sync-mode";
 
 export type RestoreMode = "overwrite" | "create";
 
@@ -89,17 +90,17 @@ interface CheckpointRun {
 
 let activeCheckpointRun: CheckpointRun | null = null;
 
-export async function pushVault(plugin: E2eeSyncPlugin, trigger: "auto" | "manual"): Promise<string> {
+export async function pushVault(plugin: E2eeSyncPlugin, trigger: "auto" | "manual", pass: SyncPass = "both"): Promise<string> {
   const ready = await openBoundClient(plugin, trigger);
   activeCheckpointRun = { plugin, counts: emptyCheckpointCounts(), tried: new Set() };
   try {
-  return await runVaultSync(plugin, ready);
+  return await runVaultSync(plugin, ready, pass);
   } finally {
     activeCheckpointRun = null;
   }
 }
 
-async function runVaultSync(plugin: E2eeSyncPlugin, ready: ReadyClient): Promise<string> {
+async function runVaultSync(plugin: E2eeSyncPlugin, ready: ReadyClient, pass: SyncPass): Promise<string> {
   await ready.client.putPolicy({
     trashDays: plugin.settings.trashDays,
     trashMaxFiles: plugin.settings.trashMaxFiles,
@@ -122,6 +123,7 @@ async function runVaultSync(plugin: E2eeSyncPlugin, ready: ReadyClient): Promise
   let downloaded = 0;
   let unchanged = 0;
   let removed = 0;
+  let pendingPull = 0;
   let deferCursor = false;
   const skippedLarge: string[] = [];
   const remoteDeletes: string[] = [];
@@ -164,6 +166,10 @@ async function runVaultSync(plugin: E2eeSyncPlugin, ready: ReadyClient): Promise
         skippedLarge.push(file.path);
         continue;
       }
+      if (planDisposition(pass, "download") === "pending-pull") {
+        pendingPull++;
+        continue;
+      }
       downloads.push({ file: remoteFile, countMiss: true });
       continue;
     }
@@ -172,6 +178,7 @@ async function runVaultSync(plugin: E2eeSyncPlugin, ready: ReadyClient): Promise
         skippedLarge.push(file.path);
         continue;
       }
+      if (planDisposition(pass, "upload") === "skip") continue;
       uploads.push({
         fileId,
         path: file.path,
@@ -190,6 +197,10 @@ async function runVaultSync(plugin: E2eeSyncPlugin, ready: ReadyClient): Promise
     if (action.type === "conflict") {
       if (plain.byteLength > fileLimit(plugin) || (remoteFile && remoteFile.size > fileLimit(plugin))) {
         skippedLarge.push(file.path);
+        continue;
+      }
+      if (planDisposition(pass, "conflict") === "pending-pull") {
+        pendingPull++;
         continue;
       }
       conflictJobs.push({
@@ -229,6 +240,10 @@ async function runVaultSync(plugin: E2eeSyncPlugin, ready: ReadyClient): Promise
         skippedLarge.push(cached.path);
         continue;
       }
+      if (planDisposition(pass, "download") === "pending-pull") {
+        pendingPull++;
+        continue;
+      }
       downloads.push({ file: remoteFile, countMiss: true });
       continue;
     }
@@ -236,6 +251,10 @@ async function runVaultSync(plugin: E2eeSyncPlugin, ready: ReadyClient): Promise
       seen.add(fileId);
       if (remoteFile && remoteFile.size > fileLimit(plugin)) {
         skippedLarge.push(cached.path);
+        continue;
+      }
+      if (planDisposition(pass, "conflict") === "pending-pull") {
+        pendingPull++;
         continue;
       }
       conflictJobs.push({
@@ -262,6 +281,10 @@ async function runVaultSync(plugin: E2eeSyncPlugin, ready: ReadyClient): Promise
       skippedLarge.push(remoteFile.fileId);
       continue;
     }
+    if (planDisposition(pass, "download") === "pending-pull") {
+      pendingPull++;
+      continue;
+    }
     downloads.push({ file: remoteFile, countMiss: false });
   }
 
@@ -281,8 +304,9 @@ async function runVaultSync(plugin: E2eeSyncPlugin, ready: ReadyClient): Promise
     const input = uploads[i];
     if (!input) continue;
     tasks.push(async () => {
-      const outcome = await uploadTracked(plugin, ready, index, input);
+      const outcome = await uploadTracked(plugin, ready, index, input, pass === "push");
       if (outcome === "uploaded") uploaded++;
+      else if (outcome === "deferred") pendingPull++;
       else uploadConflicts[i] = outcome;
       plugin.setStatus(t("syncProgress", { done: counts(), total }));
     });
@@ -305,7 +329,7 @@ async function runVaultSync(plugin: E2eeSyncPlugin, ready: ReadyClient): Promise
     const item = conflicts[i];
     if (!item) continue;
     plugin.setStatus(t("conflictTitle", { index: i + 1, total: conflicts.length }));
-    const policy = plugin.settings.conflictPolicy || "snapshot";
+    const policy = conflictPolicyForPass(normalizeSyncMode(plugin.settings.syncMode), pass, plugin.settings.conflictPolicy || "snapshot");
     const choice = policy === "ask" ? await askConflict(plugin.app, conflictView(item, i + 1, conflicts.length)) : (autoChoice(policy, item) ?? await askConflict(plugin.app, conflictView(item, i + 1, conflicts.length)));
     const outcome = await applyConflict(plugin, ready, index, item, choice, device, encoding);
     if (outcome === "resolved") {
@@ -320,23 +344,26 @@ async function runVaultSync(plugin: E2eeSyncPlugin, ready: ReadyClient): Promise
     else conflicts.push(outcome);
   }
   if (unresolved > 0) deferCursor = true;
+  if (pass === "push" && pendingPull > 0) deferCursor = true;
 
   await flushDueCheckpoints(plugin, ready, index);
 
   plugin.settings.index = index;
   if (!deferCursor && loaded.cursor !== null) plugin.settings.changeCursor = loaded.cursor;
+  plugin.settings.pendingPullCount = pass === "push" ? pendingPull : pass === "pull" ? unresolved : 0;
   const large = skippedLarge.length ? t("large", { n: skippedLarge.length }) : "";
   const deleted = removed ? t("deleted", { n: removed }) : "";
   const resolvedNote = resolved ? t("conflictsResolved", { n: resolved }) : "";
   const leftNote = unresolved ? t("conflictsLeft", { n: unresolved }) : "";
   const flushCounts = activeCheckpointRun?.counts ?? emptyCheckpointCounts();
   const flushNote = checkpointCountsMatter(flushCounts) ? t("historyFlushSummary", { ...flushCounts }) : "";
+  const pullNote = pass === "push" && pendingPull > 0 ? t("pendingPullSummary", { n: pendingPull }) : "";
   plugin.settings.lastSyncSummary = t("summary", {
     vault: ready.vaultName,
     uploaded,
     downloaded,
     unchanged,
-    large: `${deleted}${large}${resolvedNote}${leftNote}${flushNote}`,
+    large: `${deleted}${large}${resolvedNote}${leftNote}${flushNote}${pullNote}`,
   });
   await plugin.saveSettings();
   if (flushCounts.failed > 0) new Notice(t("historyFlushFailed", { n: flushCounts.failed }));
@@ -722,13 +749,15 @@ async function uploadTracked(
     remote: RemoteFile | null;
     renamed?: boolean;
   },
-): Promise<"uploaded" | PendingConflict> {
+  deferConflict = false,
+): Promise<"uploaded" | PendingConflict | "deferred"> {
   try {
     const result = await putFile(ready, input.fileId, input.path, input.plain, input.mac, input.encoding, input.mtime, input.parentRev, input.renamed === true);
     index[input.fileId] = syncedEntry(input.path, input.mtime, input.size, input.mac, input.encoding, result.rev || input.remote?.rev);
     return "uploaded";
   } catch (error) {
     if (!(error instanceof SyncConflictError)) throw error;
+    if (deferConflict) return "deferred";
     return pendingFromError(ready, input.fileId, input.path, input.plain, input.base, input.encoding, error, 0);
   }
 }
@@ -1160,6 +1189,7 @@ export async function restoreVault(
     } else {
       plugin.settings.changeCursor = null;
     }
+    plugin.settings.pendingPullCount = 0;
   }
   if (mode === "create") {
     installPluginCopy(plugin, destination);

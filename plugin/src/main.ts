@@ -13,6 +13,7 @@ import { hasActiveBinding } from "./binding";
 import { allSuffixes } from "./file-kinds";
 import { FileHistoryModal } from "./history";
 import { E2eeSettingTab } from "./settings";
+import { normalizeSyncMode, passForPull, passForSync, showsPullCommand, type SyncMode } from "./sync-mode";
 import { RestoreModal, clampTransferParallel, isSyncablePath, propagatePlugin, pushVault, restoreVault, type RestoreMode } from "./sync";
 
 export interface FileIndexEntry {
@@ -46,6 +47,13 @@ export interface SyncSettings {
   boundVaultId: string;
   boundAccountId: string;
   vaultBindings: Record<string, VaultBinding>;
+  /**
+   * Per vault. Plugin data already lives with the vault, so this is not stored
+   * on vaultBindings (that map is only the account's remote vault).
+   */
+  syncMode: SyncMode;
+  /** Remote content mode A did not apply. Zero in mode B. */
+  pendingPullCount: number;
   autoSync: boolean;
   autoSyncSeconds: number;
   transferParallel: number;
@@ -85,6 +93,8 @@ const DEFAULT_SETTINGS: SyncSettings = {
   boundVaultId: "",
   boundAccountId: "",
   vaultBindings: {},
+  syncMode: "bidirectional",
+  pendingPullCount: 0,
   autoSync: true,
   autoSyncSeconds: 30,
   transferParallel: 10,
@@ -113,6 +123,7 @@ export default class E2eeSyncPlugin extends Plugin {
   onStatus?: (text: string) => void;
   private syncing = false;
   private pending = false;
+  private pendingPull = false;
   private loginToken = 0;
   private stopTimer: (() => void) | null = null;
   private statusBar: HTMLElement | null = null;
@@ -148,6 +159,15 @@ export default class E2eeSyncPlugin extends Plugin {
       name: t("commandSync"),
       callback: () => {
         void this.syncNow(true);
+      },
+    });
+    this.addCommand({
+      id: "pull-remote",
+      name: t("commandPull"),
+      checkCallback: (checking) => {
+        if (!showsPullCommand(this.settings.syncMode)) return false;
+        if (!checking) void this.pullNow(true);
+        return true;
       },
     });
     this.addCommand({
@@ -240,6 +260,11 @@ export default class E2eeSyncPlugin extends Plugin {
     this.settings.trashDays = clampTrashDays(rest.trashDays);
     this.settings.trashMaxFiles = clampNonNegative(rest.trashMaxFiles, 200, 100_000);
     this.settings.conflictPolicy = rest.conflictPolicy === "ask" || rest.conflictPolicy === "overwrite" ? rest.conflictPolicy : "snapshot";
+    this.settings.syncMode = normalizeSyncMode(rest.syncMode);
+    const storedPending = rest.pendingPullCount;
+    this.settings.pendingPullCount = typeof storedPending === "number" && Number.isSafeInteger(storedPending) && storedPending > 0
+      ? Math.min(storedPending, 1_000_000)
+      : 0;
     const storedLimit = rest.autoVersionLimit;
     this.settings.autoVersionLimit = clampAutoVersionLimit(typeof storedLimit === "number" ? storedLimit : 100);
     this.settings.versionLimitOverrides = normalizeVersionLimits(rest.versionLimitOverrides);
@@ -319,8 +344,7 @@ export default class E2eeSyncPlugin extends Plugin {
   setAccountId(value: string): void {
     const next = value.trim();
     if (next !== this.settings.accountId) {
-      this.settings.index = {};
-      this.settings.changeCursor = null;
+      this.clearFileIndex();
       this.settings.apiToken = "";
     }
     this.settings.accountId = next;
@@ -335,10 +359,7 @@ export default class E2eeSyncPlugin extends Plugin {
     this.settings.displayName = displayName || (accountId === previous ? this.settings.displayName : "");
     const saved = this.settings.vaultBindings[accountId];
     if (saved?.vaultId) {
-      if (saved.vaultId !== this.settings.boundVaultId) {
-        this.settings.index = {};
-        this.settings.changeCursor = null;
-      }
+      if (saved.vaultId !== this.settings.boundVaultId) this.clearFileIndex();
       this.settings.boundVaultId = saved.vaultId;
       this.settings.boundVault = saved.vaultName;
       this.settings.boundAccountId = accountId;
@@ -346,10 +367,7 @@ export default class E2eeSyncPlugin extends Plugin {
     } else if (this.settings.boundAccountId === accountId && (this.settings.boundVaultId || this.settings.boundVault)) {
       this.rememberBinding(accountId);
     } else {
-      if (this.settings.boundVaultId || this.settings.boundVault) {
-        this.settings.index = {};
-        this.settings.changeCursor = null;
-      }
+      if (this.settings.boundVaultId || this.settings.boundVault) this.clearFileIndex();
       this.clearBinding();
     }
     this.refreshRibbon();
@@ -376,10 +394,7 @@ export default class E2eeSyncPlugin extends Plugin {
   async alignEncryptionWithRemote(): Promise<boolean> {
     const encrypted = await this.remoteEncrypted();
     if (this.settings.encryptNotes === encrypted) return false;
-    if (encrypted) {
-      this.settings.index = {};
-      this.settings.changeCursor = null;
-    }
+    if (encrypted) this.clearFileIndex();
     this.settings.encryptNotes = encrypted;
     await this.saveSettings();
     return true;
@@ -410,10 +425,7 @@ export default class E2eeSyncPlugin extends Plugin {
 
   async bindVault(name: string, encrypted: boolean, vaultId: string): Promise<void> {
     const switched = this.settings.boundVaultId !== vaultId || this.settings.boundAccountId !== this.settings.accountId;
-    if (switched || this.settings.encryptNotes !== encrypted) {
-      this.settings.index = {};
-      this.settings.changeCursor = null;
-    }
+    if (switched || this.settings.encryptNotes !== encrypted) this.clearFileIndex();
     this.settings.boundVault = name;
     this.settings.boundVaultId = vaultId;
     this.settings.boundAccountId = this.settings.accountId;
@@ -424,10 +436,7 @@ export default class E2eeSyncPlugin extends Plugin {
   }
 
   setSecret(value: string): void {
-    if (value !== this.settings.secretKey) {
-      this.settings.index = {};
-      this.settings.changeCursor = null;
-    }
+    if (value !== this.settings.secretKey) this.clearFileIndex();
     this.settings.secretKey = value;
   }
 
@@ -524,7 +533,16 @@ export default class E2eeSyncPlugin extends Plugin {
         current = ` · ${t("thisSynced", { time: formatStamp(entry.syncedAt) })}`;
       }
     }
-    this.statusBar.setText(`${t("pending", { n: pending })} · ${t("synced", { n: synced })}${current}`);
+    const remote = this.settings.syncMode === "push_only" && this.settings.pendingPullCount > 0
+      ? ` · ${t("pendingPull", { n: this.settings.pendingPullCount })}`
+      : "";
+    this.statusBar.setText(`${t("pending", { n: pending })} · ${t("synced", { n: synced })}${current}${remote}`);
+  }
+
+  clearFileIndex(): void {
+    this.settings.index = {};
+    this.settings.changeCursor = null;
+    this.settings.pendingPullCount = 0;
   }
 
   private isPending(path: string, mtime: number, size: number, entry: FileIndexEntry | undefined): boolean {
@@ -534,9 +552,18 @@ export default class E2eeSyncPlugin extends Plugin {
   }
 
   async syncNow(manual: boolean): Promise<boolean> {
+    return this.runBoundSync(manual, "sync");
+  }
+
+  async pullNow(manual: boolean): Promise<boolean> {
+    return this.runBoundSync(manual, "pull");
+  }
+
+  private async runBoundSync(manual: boolean, intent: "sync" | "pull"): Promise<boolean> {
     if (this.syncing) {
       if (manual) {
         this.pending = true;
+        this.pendingPull = intent === "pull";
         new Notice(t("syncing"));
       }
       return false;
@@ -559,9 +586,10 @@ export default class E2eeSyncPlugin extends Plugin {
     this.settings.lastSyncAt = Date.now();
     this.onSyncMeta?.();
     this.syncing = true;
-    this.setStatus(t("syncingNow"));
+    this.setStatus(intent === "pull" ? t("pullingNow") : t("syncingNow"));
+    const pass = intent === "pull" ? passForPull(this.settings.syncMode) : passForSync(this.settings.syncMode);
     try {
-      const summary = await pushVault(this, manual ? "manual" : "auto");
+      const summary = await pushVault(this, manual ? "manual" : "auto", pass);
       this.setStatus(summary);
       if (manual) new Notice(summary);
       return true;
@@ -579,11 +607,17 @@ export default class E2eeSyncPlugin extends Plugin {
     } finally {
       this.syncing = false;
       this.refreshLiveStatus();
-      if (this.pending) {
-        this.pending = false;
-        void this.syncNow(false);
-      }
+      this.followQueued();
     }
+  }
+
+  private followQueued(): void {
+    const pull = this.pendingPull;
+    this.pendingPull = false;
+    if (!this.pending) return;
+    this.pending = false;
+    if (pull) void this.pullNow(false);
+    else void this.syncNow(false);
   }
 
   confirmRestore(): void {
@@ -617,10 +651,7 @@ export default class E2eeSyncPlugin extends Plugin {
     } finally {
       this.syncing = false;
       this.refreshLiveStatus();
-      if (this.pending) {
-        this.pending = false;
-        void this.syncNow(false);
-      }
+      this.followQueued();
     }
   }
 }

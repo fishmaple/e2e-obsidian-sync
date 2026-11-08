@@ -194,8 +194,7 @@ export class E2eeSettingTab extends PluginSettingTab {
         }
         await new SyncClient(resolveSyncHost(this.plugin.settings.host), this.plugin.settings.apiToken).ensureVault(this.plugin.settings.boundVault, true);
         this.plugin.settings.encryptNotes = true;
-        this.plugin.settings.index = {};
-        this.plugin.settings.changeCursor = null;
+        this.plugin.clearFileIndex();
         await this.plugin.saveSettings();
         this.display();
         if (this.plugin.settings.secretKey.trim().length >= 16 && this.plugin.settings.boundVault) {
@@ -240,6 +239,23 @@ export class E2eeSettingTab extends PluginSettingTab {
       });
     }
     void this.refreshBinding();
+
+    new Setting(containerEl)
+      .setName(t("syncMode"))
+      .setDesc(this.plugin.settings.syncMode === "push_only" ? t("syncModePushDesc") : t("syncModeBothDesc"))
+      .addDropdown((drop) => {
+        drop.addOption("bidirectional", t("syncModeBoth"));
+        drop.addOption("push_only", t("syncModePush"));
+        drop.setValue(this.plugin.settings.syncMode);
+        drop.onChange(async (value) => {
+          const mode = value === "push_only" ? "push_only" : "bidirectional";
+          if (mode === this.plugin.settings.syncMode) return;
+          this.plugin.settings.syncMode = mode;
+          await this.plugin.saveSettings();
+          this.plugin.refreshLiveStatus();
+          this.display();
+        });
+      });
 
     const autoSync = new Setting(containerEl)
       .setName(t("autoSync"))
@@ -397,11 +413,14 @@ export class E2eeSettingTab extends PluginSettingTab {
         });
     }
 
-    new Setting(containerEl)
+    const actions = new Setting(containerEl)
       .setName(t("actions"))
       .addButton((button) => button.setButtonText(t("test")).onClick(() => { void this.testConnection(); }))
-      .addButton((button) => button.setButtonText(t("syncNow")).setCta().onClick(() => { void this.plugin.syncNow(true); }))
-      .addButton((button) => button.setButtonText(t("restore")).onClick(() => { this.plugin.confirmRestore(); }));
+      .addButton((button) => button.setButtonText(t("syncNow")).setCta().onClick(() => { void this.plugin.syncNow(true); }));
+    if (this.plugin.settings.syncMode === "push_only") {
+      actions.addButton((button) => button.setButtonText(t("pullRemote")).onClick(() => { void this.plugin.pullNow(true); }));
+    }
+    actions.addButton((button) => button.setButtonText(t("restore")).onClick(() => { this.plugin.confirmRestore(); }));
 
     this.statusEl = containerEl.createDiv({ cls: "e2ee-sync-status-line" });
     this.statusEl.setText(this.plugin.settings.lastSyncSummary || t("notSynced"));
@@ -607,7 +626,8 @@ export class E2eeSettingTab extends PluginSettingTab {
 function autoSyncText(plugin: E2eeSyncPlugin): string {
   const at = plugin.settings.lastSyncAt;
   const time = at ? formatSyncTime(at) : t("notSynced");
-  return `${t("autoSyncDesc")}\n${t("lastSyncLine", { time })}`;
+  const desc = plugin.settings.syncMode === "push_only" ? t("autoSyncPushDesc") : t("autoSyncDesc");
+  return `${desc}\n${t("lastSyncLine", { time })}`;
 }
 
 function formatSyncTime(ms: number): string {
@@ -721,6 +741,7 @@ class SyncTypesModal extends Modal {
     this.plugin.settings.syncSuffixes = [...this.selected];
     this.plugin.settings.syncOther = this.includeOther;
     this.plugin.settings.changeCursor = null;
+    this.plugin.settings.pendingPullCount = 0;
     await this.plugin.saveSettings();
     new Notice(t("suffixSaved"));
     this.close();
