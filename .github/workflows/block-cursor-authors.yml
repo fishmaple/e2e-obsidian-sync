@@ -1,0 +1,58 @@
+# Fail pull requests into main that contain Cursor Agent commits.
+#
+# A commit is blocked when any of these match:
+#   - author or committer email is cursoragent@cursor.com (case-insensitive)
+#   - author or committer name is "Cursor Agent" (case-insensitive)
+#   - a Co-authored-by trailer mentions that email or the name "Cursor Agent"
+#
+# The job name below is the status check to require on main.
+
+name: Block Cursor authors
+
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+
+permissions:
+  contents: read
+
+jobs:
+  block-cursor-authors:
+    name: block-cursor-authors
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Reject Cursor Agent commits
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${BASE_REF}" ] || [ -z "${HEAD_SHA}" ]; then
+            echo "::error::BASE_REF and HEAD_SHA are required"
+            exit 1
+          fi
+
+          if ! git rev-parse --verify --quiet "refs/remotes/origin/${BASE_REF}^{commit}" >/dev/null; then
+            git fetch --no-tags origin "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
+          fi
+
+          if ! git rev-parse --verify --quiet "${HEAD_SHA}^{commit}" >/dev/null; then
+            if ! git fetch --no-tags origin "pull/${PR_NUMBER}/head"; then
+              echo "::error::Unable to fetch pull request head ${HEAD_SHA}"
+              exit 1
+            fi
+          fi
+
+          bash .github/scripts/block-cursor-authors.sh "origin/${BASE_REF}" "${HEAD_SHA}"
