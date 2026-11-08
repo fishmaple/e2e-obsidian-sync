@@ -73,7 +73,8 @@ export class TrashModal extends Modal {
       await client.restoreTrash(vaultId, fileId);
       new Notice(t("trashRestored"));
       await this.render();
-      void this.plugin.syncNow(false);
+      if (this.plugin.settings.syncMode === "push_only") void this.plugin.pullNow(false);
+      else void this.plugin.syncNow(false);
     } catch (error) {
       new Notice(error instanceof Error ? error.message : t("syncFailed"));
     }
