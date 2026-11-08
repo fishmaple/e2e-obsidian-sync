@@ -1,7 +1,7 @@
 {
   "id": "e2ee-sync",
   "name": "Siltquill",
-  "version": "0.3.8-beta",
+  "version": "0.3.10-beta",
   "minAppVersion": "1.5.0",
   "description": "把库同步到你自己的服务器。端到端加密可以按库打开，并按文件保留增量版本历史。",
   "author": "Siltquill",

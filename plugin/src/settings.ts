@@ -4,7 +4,8 @@ import { PUBLIC_SERVER_HOST, type VaultStat } from "../../shared/src/protocol";
 import { SyncClient, fetchBootstrap, fetchHealth, openExternal, resolveSyncHost } from "./client";
 import { t } from "./i18n";
 import { canSealSecrets } from "./local-secret";
-import { sharedConfigProblem } from "./shared-config";
+import { isDesktopApp } from "./obsidian-dir";
+import { readSharedConfig, sharedConfigProblem, sharedLoginKind } from "./shared-config";
 import { promptBind } from "./bind-prompt";
 import { wipePlaintextHistory } from "./history";
 import { clampAutoVersionLimit } from "../../shared/src/history";
@@ -119,6 +120,7 @@ export class E2eeSettingTab extends PluginSettingTab {
       });
       void this.refreshProfile();
     }
+    this.renderSharedLogin(containerEl);
 
     new Setting(containerEl)
       .setName(t("openSite"))
@@ -439,6 +441,47 @@ export class E2eeSettingTab extends PluginSettingTab {
     super.hide();
   }
 
+  private renderSharedLogin(containerEl: HTMLElement): void {
+    const available = isDesktopApp() && !sharedConfigProblem();
+    if (!available) return;
+    const shared = readSharedConfig().config;
+    const kind = sharedLoginKind(this.plugin.settings, shared, true);
+    const account = shared?.displayName || shared?.accountId || "";
+    const desc = kind === "logged-out"
+      ? t("sharedLoginHold", { account })
+      : kind === "shared-empty"
+        ? t("sharedLoginEmpty")
+        : kind === "differs"
+          ? t("sharedLoginDiffers")
+          : kind === "matches"
+            ? t("sharedLoginMatch")
+            : t("sharedLoginScope");
+    const row = new Setting(containerEl).setName(t("sharedLogin")).setDesc(desc);
+    if (kind === "shared-empty" || kind === "differs" || kind === "matches") {
+      row.addButton((button) => {
+        button.setButtonText(t("sharedCopy"));
+        if (kind === "differs") button.setWarning();
+        button.onClick(() => {
+          const wrote = this.plugin.publishSharedLogin();
+          new Notice(wrote ? t("sharedCopied") : t("sharedCopyFailed"));
+          if (wrote) this.display();
+        });
+      });
+    } else if (kind === "logged-out") {
+      row.addButton((button) => {
+        button.setButtonText(t("sharedUse")).onClick(async () => {
+          if (!this.plugin.useSharedLogin()) {
+            new Notice(t("sharedUseFailed"));
+            return;
+          }
+          await this.plugin.saveSettings();
+          new Notice(t("sharedUsed"));
+          this.display();
+        });
+      });
+    }
+  }
+
   private async refreshProfile(): Promise<void> {
     const token = this.plugin.settings.apiToken.trim();
     if (!token) return;
@@ -470,6 +513,7 @@ export class E2eeSettingTab extends PluginSettingTab {
       }
     }
     this.plugin.rememberBinding();
+    this.plugin.settings.skipSharedLogin = true;
     this.plugin.settings.apiToken = "";
     this.plugin.settings.accountId = "";
     this.plugin.settings.displayName = "";

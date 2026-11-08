@@ -7,13 +7,13 @@ import { clampMaxFileBytes, clampNonNegative, clampTrashDays } from "./limits";
 import { offerGitignore } from "./gitignore-prompt";
 import { t } from "./i18n";
 import { openLocal, sealLocal } from "./local-secret";
-import { applySharedConfig, readSharedConfig, writeSharedConfig } from "./shared-config";
+import { applySharedConfig, readSharedConfig, shouldAdoptSharedLogin, vaultHasLogin, writeSharedConfig } from "./shared-config";
 import { promptBind } from "./bind-prompt";
 import { hasActiveBinding } from "./binding";
 import { allSuffixes } from "./file-kinds";
 import { FileHistoryModal } from "./history";
 import { E2eeSettingTab } from "./settings";
-import { normalizeSyncMode, passForPull, passForSync, showsPullCommand, type SyncMode } from "./sync-mode";
+import { formatLiveStatus, normalizeSyncMode, passForPull, passForSync, shouldNoticePendingPull, showsPullCommand, statusBarActivatesPull, type SyncMode } from "./sync-mode";
 import { RestoreModal, clampTransferParallel, isSyncablePath, propagatePlugin, pushVault, restoreVault, type RestoreMode } from "./sync";
 
 export interface FileIndexEntry {
@@ -54,6 +54,11 @@ export interface SyncSettings {
   syncMode: SyncMode;
   /** Remote content mode A did not apply. Zero in mode B. */
   pendingPullCount: number;
+  /**
+   * This vault logged out or the session expired. An empty login then stays
+   * empty instead of taking the shared login on the next launch.
+   */
+  skipSharedLogin: boolean;
   autoSync: boolean;
   autoSyncSeconds: number;
   transferParallel: number;
@@ -95,6 +100,7 @@ const DEFAULT_SETTINGS: SyncSettings = {
   vaultBindings: {},
   syncMode: "bidirectional",
   pendingPullCount: 0,
+  skipSharedLogin: false,
   autoSync: true,
   autoSyncSeconds: 30,
   transferParallel: 10,
@@ -147,7 +153,8 @@ export default class E2eeSyncPlugin extends Plugin {
     this.statusBar.addClass("mod-clickable");
     this.statusBar.addClass("e2ee-sync-live");
     this.statusBar.onclick = () => {
-      void this.syncNow(true);
+      if (statusBarActivatesPull(this.settings.syncMode, this.settings.pendingPullCount)) void this.pullNow(true);
+      else void this.syncNow(true);
     };
     this.refreshLiveStatus();
     this.registerObsidianProtocolHandler("e2ee-sync", (params) => {
@@ -226,6 +233,11 @@ export default class E2eeSyncPlugin extends Plugin {
 
   async loadSettings(): Promise<void> {
     const stored = await this.loadData() as Record<string, unknown> | null;
+    const storedHadLoginField = stored != null && (
+      Object.prototype.hasOwnProperty.call(stored, "accountId")
+      || Object.prototype.hasOwnProperty.call(stored, "apiToken")
+      || Object.prototype.hasOwnProperty.call(stored, "apiTokenBox")
+    );
     const legacyPlain = Boolean(stored && (typeof stored.secretKey === "string" || typeof stored.apiToken === "string"));
     const secretKey = openLocal(stored?.secretKeyBox) || (typeof stored?.secretKey === "string" ? stored.secretKey : "");
     const apiToken = openLocal(stored?.apiTokenBox) || (typeof stored?.apiToken === "string" ? stored.apiToken : "");
@@ -265,6 +277,7 @@ export default class E2eeSyncPlugin extends Plugin {
     this.settings.pendingPullCount = typeof storedPending === "number" && Number.isSafeInteger(storedPending) && storedPending > 0
       ? Math.min(storedPending, 1_000_000)
       : 0;
+    this.settings.skipSharedLogin = rest.skipSharedLogin === true;
     const storedLimit = rest.autoVersionLimit;
     this.settings.autoVersionLimit = clampAutoVersionLimit(typeof storedLimit === "number" ? storedLimit : 100);
     this.settings.versionLimitOverrides = normalizeVersionLimits(rest.versionLimitOverrides);
@@ -289,7 +302,13 @@ export default class E2eeSyncPlugin extends Plugin {
     this.settings.boundVaultId = typeof rest.boundVaultId === "string" ? rest.boundVaultId : "";
     this.settings.vaultBindings = normalizeBindings(rest.vaultBindings);
     const shared = readSharedConfig();
-    applySharedConfig(this.settings, shared.config);
+    applySharedConfig(this.settings, shared.config, {
+      applyLogin: shouldAdoptSharedLogin({
+        hasLogin: vaultHasLogin(this.settings),
+        skipSharedLogin: this.settings.skipSharedLogin,
+        storedHadLoginField,
+      }),
+    });
     if (this.settings.boundVault && this.settings.accountId && !this.settings.boundAccountId) {
       this.settings.boundAccountId = this.settings.accountId;
     }
@@ -298,7 +317,7 @@ export default class E2eeSyncPlugin extends Plugin {
   }
 
   async saveSettings(): Promise<void> {
-    writeSharedConfig(this.settings);
+    writeSharedConfig(this.settings, "seed");
     const { secretKey, apiToken, ...rest } = this.settings;
     await this.saveData({
       ...rest,
@@ -352,6 +371,7 @@ export default class E2eeSyncPlugin extends Plugin {
   }
 
   setLogin(accountId: string, apiToken: string, displayName = ""): void {
+    this.settings.skipSharedLogin = !accountId.trim() && !apiToken.trim();
     const previous = this.settings.accountId;
     if (previous && previous !== accountId) this.rememberBinding(previous);
     this.settings.accountId = accountId;
@@ -504,10 +524,35 @@ export default class E2eeSyncPlugin extends Plugin {
     this.stopTimer = cancel;
   }
 
-  setStatus(text: string): void {
-    const short = text.length > 80 ? `${text.slice(0, 80)}…` : text;
-    this.statusBar?.setText(short);
+  /**
+   * `settings` updates the settings line and leaves the status bar alone, so a
+   * finished summary cannot cover the pending-pull cue.
+   */
+  setStatus(text: string, target: "all" | "settings" = "all"): void {
+    if (target === "all") {
+      const short = text.length > 80 ? `${text.slice(0, 80)}…` : text;
+      this.statusBar?.setText(short);
+      this.statusBar?.removeClass("is-pending-pull");
+    }
     this.onStatus?.(text);
+  }
+
+  /** Write this vault's login over the shared file. Does nothing when logged out. */
+  publishSharedLogin(): boolean {
+    if (!vaultHasLogin(this.settings)) return false;
+    return writeSharedConfig(this.settings, "replace");
+  }
+
+  /** Opt in to the shared login after this vault has logged out. */
+  useSharedLogin(): boolean {
+    if (vaultHasLogin(this.settings)) return false;
+    const shared = readSharedConfig().config;
+    if (!shared || !vaultHasLogin(shared)) return false;
+    if (!this.settings.host.trim() && shared.host?.trim()) this.settings.host = shared.host;
+    if (!this.settings.accessToken.trim() && shared.accessToken) this.settings.accessToken = shared.accessToken;
+    if (!this.settings.secretKey && shared.secretKey) this.setSecret(shared.secretKey);
+    this.setLogin(shared.accountId ?? "", shared.apiToken ?? "", shared.displayName ?? "");
+    return true;
   }
 
   refreshLiveStatus(): void {
@@ -533,10 +578,19 @@ export default class E2eeSyncPlugin extends Plugin {
         current = ` · ${t("thisSynced", { time: formatStamp(entry.syncedAt) })}`;
       }
     }
-    const remote = this.settings.syncMode === "push_only" && this.settings.pendingPullCount > 0
-      ? ` · ${t("pendingPull", { n: this.settings.pendingPullCount })}`
-      : "";
-    this.statusBar.setText(`${t("pending", { n: pending })} · ${t("synced", { n: synced })}${current}${remote}`);
+    const pullFirst = statusBarActivatesPull(this.settings.syncMode, this.settings.pendingPullCount);
+    this.statusBar.setText(formatLiveStatus({
+      pendingPull: pullFirst ? t("pendingPull", { n: this.settings.pendingPullCount }) : "",
+      pending: t("pending", { n: pending }),
+      synced: t("synced", { n: synced }),
+      current,
+      pullFirst,
+    }));
+    if (pullFirst) this.statusBar.addClass("is-pending-pull");
+    else this.statusBar.removeClass("is-pending-pull");
+    const label = pullFirst ? t("pendingPullClick") : t("syncNow");
+    this.statusBar.setAttribute("aria-label", label);
+    this.statusBar.setAttribute("title", label);
   }
 
   clearFileIndex(): void {
@@ -588,10 +642,19 @@ export default class E2eeSyncPlugin extends Plugin {
     this.syncing = true;
     this.setStatus(intent === "pull" ? t("pullingNow") : t("syncingNow"));
     const pass = intent === "pull" ? passForPull(this.settings.syncMode) : passForSync(this.settings.syncMode);
+    const pendingBefore = this.settings.pendingPullCount;
     try {
       const summary = await pushVault(this, manual ? "manual" : "auto", pass);
-      this.setStatus(summary);
+      this.setStatus(summary, "settings");
       if (manual) new Notice(summary);
+      if (shouldNoticePendingPull({
+        pass,
+        before: pendingBefore,
+        after: this.settings.pendingPullCount,
+        manual,
+      })) {
+        new Notice(t("pendingPullNotice", { n: this.settings.pendingPullCount }), 10000);
+      }
       return true;
     } catch (error) {
       if (error instanceof SessionExpiredError) {
