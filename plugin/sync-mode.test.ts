@@ -3,11 +3,14 @@ import test from "node:test";
 import { decideSyncAction } from "../shared/src/reconcile";
 import {
   conflictPolicyForPass,
+  formatLiveStatus,
   normalizeSyncMode,
   passForPull,
   passForSync,
   planDisposition,
+  shouldNoticePendingPull,
   showsPullCommand,
+  statusBarActivatesPull,
   type PlannedKind,
 } from "./src/sync-mode";
 
@@ -94,6 +97,38 @@ test("deletion of an unchanged file still propagates in push mode", () => {
   assert.equal(planDisposition("push", localGone.type), "run");
   assert.equal(planDisposition("pull", remoteGone.type), "run");
   assert.equal(planDisposition("pull", localGone.type), "run");
+});
+
+test("push-only status leads with the pending pull and the click pulls", () => {
+  assert.equal(statusBarActivatesPull("push_only", 2), true);
+  assert.equal(statusBarActivatesPull("push_only", 0), false);
+  assert.equal(statusBarActivatesPull("bidirectional", 4), false);
+  const crowded = formatLiveStatus({
+    pendingPull: "[Pull 2]",
+    pending: "Unsynced 1",
+    synced: "Synced 9",
+    current: " · This note is pending",
+    pullFirst: true,
+  });
+  assert.equal(crowded, "[Pull 2] · Unsynced 1 · Synced 9 · This note is pending");
+  assert.equal(crowded.startsWith("[Pull 2]"), true);
+  assert.equal(formatLiveStatus({
+    pendingPull: "[Pull 2]",
+    pending: "Unsynced 1",
+    synced: "Synced 9",
+    current: "",
+    pullFirst: false,
+  }), "Unsynced 1 · Synced 9");
+});
+
+test("pending-pull notice follows a push that still has remote changes", () => {
+  assert.equal(shouldNoticePendingPull({ pass: "push", before: 0, after: 3, manual: false }), true);
+  assert.equal(shouldNoticePendingPull({ pass: "push", before: 3, after: 5, manual: false }), true);
+  assert.equal(shouldNoticePendingPull({ pass: "push", before: 3, after: 3, manual: false }), false);
+  assert.equal(shouldNoticePendingPull({ pass: "push", before: 3, after: 3, manual: true }), true);
+  assert.equal(shouldNoticePendingPull({ pass: "push", before: 3, after: 0, manual: true }), false);
+  assert.equal(shouldNoticePendingPull({ pass: "both", before: 0, after: 3, manual: true }), false);
+  assert.equal(shouldNoticePendingPull({ pass: "pull", before: 0, after: 2, manual: true }), false);
 });
 
 test("a diverged file is a conflict held on push and asked on mode A pull", () => {
