@@ -14,6 +14,11 @@
   cursor: pointer;
 }
 
+.e2ee-sync-live.is-pending-pull {
+  color: var(--text-accent);
+  font-weight: 600;
+}
+
 .e2ee-sync-vaults {
   display: grid;
   gap: 8px;

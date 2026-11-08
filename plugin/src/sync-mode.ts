@@ -38,6 +38,41 @@ export function showsPullCommand(mode: SyncMode): boolean {
   return mode === "push_only";
 }
 
+/** Status-bar click pulls while push-only still has remote changes waiting. */
+export function statusBarActivatesPull(mode: SyncMode, pendingPullCount: number): boolean {
+  return mode === "push_only" && pendingPullCount > 0;
+}
+
+/**
+ * Leading pending-pull segment. The live bar is crowded and clips the tail,
+ * so the cue has to be the first fragment.
+ */
+export function formatLiveStatus(input: {
+  pendingPull: string;
+  pending: string;
+  synced: string;
+  current: string;
+  pullFirst: boolean;
+}): string {
+  const lead = input.pullFirst && input.pendingPull ? `${input.pendingPull} · ` : "";
+  return `${lead}${input.pending} · ${input.synced}${input.current}`;
+}
+
+/**
+ * A push that still has remote changes waiting. Auto sync stays quiet when the
+ * count did not change, so the timer does not raise the same notice every interval.
+ * A manual sync always notices.
+ */
+export function shouldNoticePendingPull(input: {
+  pass: SyncPass;
+  before: number;
+  after: number;
+  manual: boolean;
+}): boolean {
+  if (input.pass !== "push" || input.after <= 0) return false;
+  return input.manual || input.after !== input.before;
+}
+
 /**
  * Push uploads and still propagates deletions, but does not apply remote
  * content. Pull applies remote content and deletions, and leaves clean local

@@ -13,6 +13,49 @@ export interface SharedSyncConfig {
 
 const FILE = "e2ee-sync.json";
 
+export type SharedWriteMode = "seed" | "replace";
+
+export type SharedLoginKind = "unavailable" | "both-empty" | "logged-out" | "shared-empty" | "differs" | "matches";
+
+export function vaultHasLogin(settings: { accountId?: string; apiToken?: string } | null | undefined): boolean {
+  if (!settings) return false;
+  return Boolean(settings.accountId?.trim() || settings.apiToken?.trim());
+}
+
+/**
+ * Shared credentials are a first open convenience. A vault that already stored
+ * a login field, including an empty one after logout, keeps that choice.
+ */
+export function shouldAdoptSharedLogin(input: {
+  hasLogin: boolean;
+  skipSharedLogin: boolean;
+  storedHadLoginField: boolean;
+}): boolean {
+  return !input.hasLogin && !input.skipSharedLogin && !input.storedHadLoginField;
+}
+
+/**
+ * How this vault's login relates to the desktop file.
+ * `logged-out` is an empty vault with a shared login waiting (including after logout).
+ */
+export function sharedLoginKind(
+  vault: Pick<SharedSyncConfig, "accountId" | "apiToken" | "secretKey" | "accessToken">,
+  shared: Partial<SharedSyncConfig> | null,
+  available: boolean,
+): SharedLoginKind {
+  if (!available) return "unavailable";
+  const vaultLogin = vaultHasLogin(vault);
+  const sharedLogin = vaultHasLogin(shared);
+  if (!vaultLogin && !sharedLogin) return "both-empty";
+  if (!vaultLogin && sharedLogin) return "logged-out";
+  if (vaultLogin && !sharedLogin) return "shared-empty";
+  const same = vault.accountId === (shared?.accountId ?? "")
+    && vault.apiToken === (shared?.apiToken ?? "")
+    && vault.secretKey === (shared?.secretKey ?? "")
+    && vault.accessToken === (shared?.accessToken ?? "");
+  return same ? "matches" : "differs";
+}
+
 export function sharedConfigProblem(): boolean {
   return isDesktopApp() && !obsidianConfigDir();
 }
@@ -43,45 +86,102 @@ export function readSharedConfig(): { config: Partial<SharedSyncConfig> | null; 
   }
 }
 
-export function writeSharedConfig(config: SharedSyncConfig): void {
-  if (!isDesktopApp()) return;
+/**
+ * `seed` writes the first login, including its host, into an empty shared file.
+ * It never replaces a login that is already there, and a logged-out vault does
+ * not wipe the file. `replace` is the explicit "copy this vault's login" action.
+ * Returns null when the file should be left untouched.
+ */
+export function mergeSharedConfig(
+  existing: Partial<SharedSyncConfig> | null,
+  incoming: SharedSyncConfig,
+  mode: SharedWriteMode,
+): SharedSyncConfig | null {
+  if (mode === "replace") {
+    if (!vaultHasLogin(incoming)) return null;
+    const next = copyShared(incoming);
+    if (!next.host.trim() && existing?.host?.trim()) next.host = existing.host;
+    return next;
+  }
+  const next = copyShared(existing ?? {});
+  if (vaultHasLogin(next) || !vaultHasLogin(incoming)) return null;
+  if (!next.host.trim() && incoming.host.trim()) next.host = incoming.host;
+  next.accountId = incoming.accountId;
+  next.displayName = incoming.displayName;
+  next.apiToken = incoming.apiToken;
+  next.secretKey = incoming.secretKey;
+  next.accessToken = incoming.accessToken;
+  return next;
+}
+
+export function writeSharedConfig(config: SharedSyncConfig, mode: SharedWriteMode = "seed"): boolean {
+  if (!isDesktopApp()) return false;
   const dir = obsidianConfigDir();
   if (!dir) {
     warnMissingObsidianConfig();
-    return;
+    return false;
   }
-  const empty = !config.accountId && !config.apiToken && !config.secretKey;
-  if (empty) {
-    const existing = readSharedConfig();
-    if (!existing.config?.accountId && !existing.config?.apiToken && !existing.config?.secretKey) return;
+  const existing = readSharedConfig();
+  let next = mergeSharedConfig(existing.config, config, mode);
+  if (!next) {
+    if (!(mode === "seed" && existing.hadPlaintext && existing.config && vaultHasLogin(existing.config))) return false;
+    next = copyShared(existing.config);
   }
   const body = {
-    host: config.host,
-    accountId: config.accountId,
-    displayName: config.displayName,
-    accessToken: config.accessToken,
-    apiTokenBox: sealLocal(config.apiToken) satisfies LocalBox,
-    secretKeyBox: sealLocal(config.secretKey) satisfies LocalBox,
+    host: next.host,
+    accountId: next.accountId,
+    displayName: next.displayName,
+    accessToken: next.accessToken,
+    apiTokenBox: sealLocal(next.apiToken) satisfies LocalBox,
+    secretKeyBox: sealLocal(next.secretKey) satisfies LocalBox,
   };
   try {
     const fs = node();
     const path = fs.join(dir, FILE);
     fs.mkdirSync(fs.dirname(path), { recursive: true });
     fs.writeText(path, JSON.stringify(body, null, 2));
+    return true;
   } catch (error) {
     console.warn("Could not write the config shared across vaults", error);
+    return false;
   }
 }
 
-export function applySharedConfig<T extends SharedSyncConfig>(settings: T, shared: Partial<SharedSyncConfig> | null): T {
+/**
+ * Credentials and host are copied only when `applyLogin` is set.
+ * The default is a vault that has no login yet. A vault that already has a
+ * login keeps its host and credentials, including an empty host or secret.
+ * An empty host means the default server, so it is not a blank to fill in.
+ */
+export function applySharedConfig<T extends SharedSyncConfig>(
+  settings: T,
+  shared: Partial<SharedSyncConfig> | null,
+  options?: { applyLogin?: boolean },
+): T {
   if (!shared) return settings;
-  if (typeof shared.host === "string") settings.host = shared.host;
+  const applyLogin = options?.applyLogin ?? !vaultHasLogin(settings);
+  if (!applyLogin || !vaultHasLogin(shared)) return settings;
+  if (!settings.host.trim() && typeof shared.host === "string" && shared.host.trim()) {
+    settings.host = shared.host;
+  }
   if (typeof shared.accountId === "string") settings.accountId = shared.accountId;
   if (typeof shared.displayName === "string") settings.displayName = shared.displayName;
   if (typeof shared.apiToken === "string") settings.apiToken = shared.apiToken;
   if (typeof shared.secretKey === "string") settings.secretKey = shared.secretKey;
   if (typeof shared.accessToken === "string") settings.accessToken = shared.accessToken;
   return settings;
+}
+
+function copyShared(config: Partial<SharedSyncConfig>): SharedSyncConfig {
+  return {
+    host: typeof config.host === "string" ? config.host : "",
+    accountId: typeof config.accountId === "string" ? config.accountId : "",
+    displayName: typeof config.displayName === "string" ? config.displayName : "",
+    apiToken: typeof config.apiToken === "string" ? config.apiToken : "",
+    secretKey: typeof config.secretKey === "string" ? config.secretKey : "",
+    accessToken: typeof config.accessToken === "string" ? config.accessToken : "",
+    encryptNotes: false,
+  };
 }
 
 interface NodeApi {
