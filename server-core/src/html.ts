@@ -107,7 +107,7 @@ export function layout(title: string, body: string, here = ""): string {
 function topNav(here: string): string {
   const item = (href: string, id: string, label: string) =>
     `<a href="${href}"${here === id ? ' class="is-here"' : ""}>${label}</a>`;
-  return `<nav class="topnav">${item("/", "home", "首页")}${item("/install", "install", "安装插件")}${item("/login", "login", "登录")}${item("/account", "account", "同步情况")}<a href="https://obsidian.md/" target="_blank" rel="noopener">Obsidian 官网</a></nav>`;
+  return `<nav class="topnav">${item("/", "home", "首页")}${item("/install", "install", "安装插件")}${item("/login", "login", "登录")}${item("/account", "account", "同步情况")}${item("/pair", "pair", "匹配码")}<a href="https://obsidian.md/" target="_blank" rel="noopener">Obsidian 官网</a></nav>`;
 }
 
 export function loginPage(options: {
@@ -300,6 +300,16 @@ export function accountPage(options: {
       </table>
     </div>
     <div class="card">
+      <h2 style="margin-top:0">匹配码</h2>
+      <p>生成一张 10 分钟、一次性的匹配码，在另一台 Obsidian 里登录这个账户。匹配码不会新建账户。</p>
+      <form method="post" action="/pair">
+        <div class="row">
+          <button type="submit">生成匹配码</button>
+          <a class="button secondary" href="/pair">查看说明</a>
+        </div>
+      </form>
+    </div>
+    <div class="card">
       <h2 style="margin-top:0">插件里怎么填</h2>
       <ol>
         <li>Host：自建服务器地址。留空则使用插件里的公共服务器。</li>
@@ -325,6 +335,57 @@ export function accountPage(options: {
       };
     </script>
   `, "account");
+}
+
+export function pairPage(options: {
+  origin: string;
+  code?: string;
+  expiresAt?: number;
+  accountId?: string;
+}): string {
+  const shown = options.code
+    ? `<div class="card">
+        <div class="muted">此服务器的匹配码</div>
+        <div class="code" id="pairing-code">${esc(options.code)}</div>
+        <p class="muted">账户 ${esc(options.accountId ?? "")} · ${esc(formatTime(options.expiresAt ?? 0))} 前有效 · 用一次就失效</p>
+        <button type="button" id="copy-code">复制匹配码</button>
+        <p class="muted">再生成一张会作废这一张。离开本页后不再显示，请先复制。码里没有 0、O、1、I。</p>
+      </div>`
+    : `<div class="card">
+        <p>还没有新的匹配码。用已登录的账户，或由管理员，生成一张后会显示在这里。</p>
+      </div>`;
+  return layout("匹配码", `
+    <p>匹配码把另一台 Obsidian 登进已有账户。它不会注册新账户。</p>
+    ${shown}
+    <div class="card">
+      <h2 style="margin-top:0">怎么生成</h2>
+      <ol>
+        <li>已有账户：登录后打开<a class="inline" href="/account">同步情况</a>，点「生成匹配码」。</li>
+        <li>管理员：打开管理页，在对应账户上点「生成匹配码」。</li>
+      </ol>
+      <p class="muted">10 分钟内有效，只能用一次。同一账户同时只有一张有效码。</p>
+    </div>
+    <div class="card">
+      <h2 style="margin-top:0">在插件里填写</h2>
+      <ol>
+        <li>Host：<span class="id">${esc(options.origin)}</span></li>
+        <li>匹配码：上面的 8 位码，可以写成 XXXX-XXXX。</li>
+        <li>点「用匹配码登录」。成功后按原来的流程绑定仓库。</li>
+      </ol>
+    </div>
+    <script>
+      const button = document.getElementById("copy-code");
+      if (button) button.onclick = async () => {
+        const value = document.getElementById("pairing-code").textContent.trim();
+        try {
+          await navigator.clipboard.writeText(value);
+          button.textContent = "已复制";
+        } catch (e) {
+          button.textContent = "请手动复制";
+        }
+      };
+    </script>
+  `, "pair");
 }
 
 export function homePage(options: { loggedIn: boolean }): string {
@@ -642,6 +703,10 @@ export function adminPage(options: {
         <input type="hidden" name="accountId" value="${esc(account.id)}">
         <input name="loginId" placeholder="登录 ID" value="${esc(account.loginId)}" required>
         <button type="submit">重置密码</button>
+      </form>
+      <form method="post" action="/pair" style="margin-top:8px">
+        <input type="hidden" name="accountId" value="${esc(account.id)}">
+        <button type="submit">生成匹配码</button>
       </form>
     </td>
   </tr>`).join("");

@@ -20,6 +20,7 @@ export class E2eeSettingTab extends PluginSettingTab {
   private statusEl: HTMLElement | null = null;
   private loginId = "";
   private loginPassword = "";
+  private pairingCode = "";
   private currentPassword = "";
   private nextPassword = "";
 
@@ -86,6 +87,19 @@ export class E2eeSettingTab extends PluginSettingTab {
         });
       });
       containerEl.createEl("p", { text: t("loginDesc"), cls: "e2ee-sync-status-line" });
+      new Setting(containerEl)
+        .setName(t("pairingCode"))
+        .setDesc(t("pairingCodeDesc"))
+        .addText((text) => {
+          text.setPlaceholder("XXXX-XXXX")
+            .setValue(this.pairingCode)
+            .onChange((value) => { this.pairingCode = value.trim(); });
+        })
+        .addButton((button) => {
+          button.setButtonText(t("pairingLogin")).onClick(() => {
+            void this.redeemPairing();
+          });
+        });
     } else {
       account.setDesc("");
       account.descEl.createDiv({ text: t("accountNameLine", { name: this.plugin.settings.displayName || this.plugin.settings.accountId }) });
@@ -511,6 +525,27 @@ export class E2eeSettingTab extends PluginSettingTab {
       this.display();
     } catch (error) {
       new Notice(error instanceof Error ? error.message : t("syncFailed"));
+    }
+  }
+
+  private async redeemPairing(): Promise<void> {
+    if (!this.pairingCode.trim()) {
+      new Notice(t("pairingNeedCode"));
+      return;
+    }
+    try {
+      const host = resolveSyncHost(this.plugin.settings.host);
+      const session = await new SyncClient(host, "").redeemPairing(this.pairingCode);
+      this.plugin.setLogin(session.accountId, session.apiToken, session.displayName ?? "");
+      this.pairingCode = "";
+      await this.plugin.saveSettings();
+      await this.plugin.refreshBoundIdentity();
+      await this.plugin.alignEncryptionWithRemote();
+      new Notice(t("loggedIn"));
+      this.display();
+      if (!hasActiveBinding(this.plugin.settings)) promptBind(this.plugin);
+    } catch (error) {
+      new Notice(error instanceof Error ? error.message : t("pairingFailed"));
     }
   }
 

@@ -8,6 +8,7 @@ import {
   DEVICE_TTL_MS,
   MAX_BODY_BYTES,
   MAX_FILE_BYTES,
+  PAIRING_TTL_MS,
   PROTOCOL_VERSION,
   type Encoding,
   type ObjectPayload,
@@ -17,7 +18,7 @@ import {
 import type { AppConfig } from "./config";
 import { TipMovedError, type ObjectRow, type SyncDb } from "./db";
 import { HttpError } from "./http-error";
-import { accessPage, accountPage, adminPage, homePage, installPage, installPs1, installSh, loginPage, messagePage, obsidianReturnPage } from "./html";
+import { accessPage, accountPage, adminPage, homePage, installPage, installPs1, installSh, loginPage, messagePage, obsidianReturnPage, pairPage } from "./html";
 import { createBlobStore } from "./storage";
 import { acceptServerUpload, directRequestValid, discardUpload, finishUpload, listTransferUrls, listVersionDownloads, serverDownload, serverVersionDownload, versionRequestValid } from "./urls";
 import { assertVersionId, forgetVersionBlobs, historyResponse, parseCheckpointUpload, parseHistoryOptions, parseRetentionBody, recordHistory, retentionFor, storeUploadedCheckpoint, toVersionInfo } from "./versions";
@@ -30,6 +31,8 @@ const DEVICE_CODE = /^[A-Za-z0-9_-]{32,128}$/;
 const LOGIN_STATE = /^[A-Za-z0-9_-]{22,128}$/;
 const USERNAME = /^[^\u0000-\u001f\u007f]{2,64}$/;
 const VAULT_NAME = /^[^\u0000-\u001f\u007f\\/]{1,120}$/;
+const PAIRING_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
+const PAIRING_CODE = /^[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{8}$/;
 
 export { HttpError } from "./http-error";
 
@@ -43,6 +46,7 @@ export function createApp(deps: AppDeps): Hono {
   const blobs = createBlobStore(config, db);
   const app = new Hono();
   let deviceStarts: number[] = [];
+  const pairingRedeems: number[] = [];
 
   app.use("*", async (c, next) => {
     await next();
@@ -285,6 +289,28 @@ export function createApp(deps: AppDeps): Hono {
       focusId: c.req.query("vault"),
       mode: "central",
     }));
+  });
+
+  app.get("/pair", (c) => {
+    c.header("cache-control", "no-store");
+    const flash = takePairingFlash(c);
+    return c.html(pairPage({ origin: publicOrigin(c), ...flash }));
+  });
+
+  app.post("/pair", async (c) => {
+    assertSameOrigin(c);
+    const form = await c.req.parseBody();
+    let accountId: string;
+    try {
+      accountId = await pairingAccount(c, String(form.accountId ?? ""));
+    } catch (error) {
+      if (error instanceof HttpError && error.status === 401) return c.redirect("/login");
+      throw error;
+    }
+    const issued = await issuePairingCode(accountId);
+    c.header("cache-control", "no-store");
+    c.header("Set-Cookie", pairingFlashCookie(issued, isSecure(c)));
+    return c.redirect("/pair");
   });
 
   const api = new Hono();
@@ -653,6 +679,37 @@ export function createApp(deps: AppDeps): Hono {
       removed.push(...await db.deleteUnnamed(accountId));
     }
     return c.json({ deleted: removed.length });
+  });
+
+  api.post("/pairing/create", async (c) => {
+    const raw = await readBody(c, 8 * 1024);
+    const body = (raw.byteLength === 0 ? {} : parseJson(raw)) as { accountId?: unknown };
+    const requested = typeof body.accountId === "string" ? body.accountId : "";
+    const accountId = await pairingAccount(c, requested);
+    return c.json(await issuePairingCode(accountId));
+  });
+
+  api.post("/pairing/redeem", async (c) => {
+    if (tooMany(pairingRedeems)) throw new HttpError(429, "Too many login attempts. Try again later.");
+    let presented = "";
+    try {
+      const body = parseJson(await readBody(c, 8 * 1024)) as { code?: unknown };
+      presented = typeof body.code === "string" ? body.code : "";
+    } catch (error) {
+      if (error instanceof HttpError && error.status === 400) {
+        throw new HttpError(400, "The pairing code is invalid or expired");
+      }
+      throw error;
+    }
+    const normalized = normalizePairingCode(presented);
+    const accountId = normalized ? await db.takePairingCode(normalized) : undefined;
+    const account = accountId ? await db.findAccount(accountId) : undefined;
+    if (!account) throw new HttpError(400, "The pairing code is invalid or expired");
+    return c.json({
+      accountId: account.id,
+      displayName: account.displayName,
+      apiToken: await db.issueToken(account.id, config.sessionTtlMs),
+    });
   });
 
   api.post("/login", async (c) => {
@@ -1051,6 +1108,67 @@ export function createApp(deps: AppDeps): Hono {
     return (await db.findAccount(accountId))?.displayName ?? "";
   }
 
+  async function pairingAccount(c: Context, requestedId?: string): Promise<string> {
+    const requested = (requestedId ?? "").trim();
+    const admin = adminOpen(c);
+    if (admin && requested) {
+      const account = await db.findAccount(requested);
+      if (!account) throw new HttpError(404, "The account does not exist");
+      return account.id;
+    }
+    const bearer = await accountFromBearer(c);
+    if (bearer) return bearer;
+    const session = sessionAccount(c);
+    if (session && await db.findAccount(session)) return session;
+    if (config.mode === "single" && (hasAccess(c) || admin)) {
+      return (await db.ensureSingleAccount()).id;
+    }
+    if (admin) throw new HttpError(400, "Choose an account for the pairing code");
+    throw new HttpError(401, "Log in before creating a pairing code");
+  }
+
+  async function accountFromBearer(c: Context): Promise<string | undefined> {
+    const header = c.req.header("authorization") ?? "";
+    if (!header) return undefined;
+    const match = /^Bearer\s+(\S+)$/i.exec(header);
+    if (!match?.[1]) throw new HttpError(401, "Log in before creating a pairing code");
+    const accountId = await db.findAccountByToken(match[1]);
+    if (!accountId) throw new HttpError(401, "The login expired. Log in again.");
+    return accountId;
+  }
+
+  async function issuePairingCode(accountId: string): Promise<{ code: string; expiresAt: number; accountId: string }> {
+    const expiresAt = Date.now() + PAIRING_TTL_MS;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const raw = randomPairingCode();
+      try {
+        await db.replacePairingCode(accountId, raw, expiresAt);
+        return { code: formatPairingCode(raw), expiresAt, accountId };
+      } catch {
+        if (attempt === 4) throw new HttpError(500, "Could not create a pairing code");
+      }
+    }
+    throw new HttpError(500, "Could not create a pairing code");
+  }
+
+  function takePairingFlash(c: Context): { code: string; expiresAt: number; accountId: string } | undefined {
+    const raw = readCookie(c.req.header("cookie"), "sync_pairing");
+    if (!raw) return undefined;
+    c.header("Set-Cookie", "sync_pairing=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0");
+    try {
+      const parsed = JSON.parse(Buffer.from(raw, "base64url").toString("utf8")) as {
+        code?: unknown;
+        expiresAt?: unknown;
+        accountId?: unknown;
+      };
+      if (typeof parsed.code !== "string" || typeof parsed.expiresAt !== "number" || typeof parsed.accountId !== "string") return undefined;
+      if (!/^[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{4}-[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{4}$/.test(parsed.code)) return undefined;
+      return { code: parsed.code, expiresAt: parsed.expiresAt, accountId: parsed.accountId };
+    } catch {
+      return undefined;
+    }
+  }
+
   async function requireToken(c: Context): Promise<{ accountId: string }> {
     const header = c.req.header("authorization") ?? "";
     const match = /^Bearer\s+(\S+)$/i.exec(header);
@@ -1409,6 +1527,39 @@ function accessCookie(token: string, secure: boolean): string {
     "Path=/",
     "Max-Age=2592000",
   ];
+  if (secure) parts.push("Secure");
+  return parts.join("; ");
+}
+
+function tooMany(bucket: number[], limit = 100, windowMs = 10 * 60 * 1000): boolean {
+  const now = Date.now();
+  const fresh = bucket.filter((time) => now - time < windowMs);
+  bucket.length = 0;
+  bucket.push(...fresh);
+  if (fresh.length >= limit) return true;
+  bucket.push(now);
+  return false;
+}
+
+function normalizePairingCode(input: string): string | undefined {
+  if (input.length > 32) return undefined;
+  const compact = input.replace(/[\s-]/g, "").toUpperCase();
+  return PAIRING_CODE.test(compact) ? compact : undefined;
+}
+
+function formatPairingCode(raw: string): string {
+  return `${raw.slice(0, 4)}-${raw.slice(4, 8)}`;
+}
+
+function randomPairingCode(): string {
+  let raw = "";
+  for (const byte of randomBytes(8)) raw += PAIRING_ALPHABET[byte % PAIRING_ALPHABET.length];
+  return raw;
+}
+
+function pairingFlashCookie(payload: { code: string; expiresAt: number; accountId: string }, secure: boolean): string {
+  const value = Buffer.from(JSON.stringify(payload)).toString("base64url");
+  const parts = [`sync_pairing=${encodeURIComponent(value)}`, "HttpOnly", "SameSite=Lax", "Path=/", "Max-Age=120"];
   if (secure) parts.push("Secure");
   return parts.join("; ");
 }
